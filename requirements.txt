@@ -1,0 +1,18 @@
+# Jupyter
+jupyter
+notebook
+ipykernel
+
+# Data handling
+pandas
+openpyxl
+
+# AIS message parsing
+pyais
+
+# Visualization
+matplotlib
+seaborn
+
+# Utilities
+numpy

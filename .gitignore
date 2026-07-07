@@ -1,0 +1,11 @@
+# Virtual environment
+.venv/
+
+# Excel data files
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
