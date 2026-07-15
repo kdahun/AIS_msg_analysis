@@ -9,7 +9,8 @@ from components import charts
 
 TITLE = "신호 유효성"
 
-SAMPLE_SIZE = 20_000   # 산점도에 표시할 표본 상한
+SAMPLE_SIZE = 20_000    # 산점도에 표시할 표본 상한
+TRAJ_MMSI_LIMIT = 10    # 궤적 그래프에서 한번에 색으로 구분해 보여줄 MMSI 상한
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -86,3 +87,22 @@ def render():
 
     with st.expander("거리구간별 baseline 테이블 보기"):
         st.dataframe(baseline.round(2), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 선박 궤적 — 시간에 따른 거리 · RSSI 변화")
+    if not mmsis:
+        st.info(
+            "위 'MMSI 필터'에서 선박을 1개 이상 선택하면, 그 배가 시간이 지나며 수신국에 "
+            "가까워지거나 멀어질 때 거리와 RSSI가 같이 어떻게 움직이는지 볼 수 있습니다. "
+            "(거리가 줄어들 때 RSSI도 세지면 정상, 거리와 상관없이 RSSI만 튀면 이상 신호 후보)"
+        )
+    elif df["mmsi"].nunique() > TRAJ_MMSI_LIMIT:
+        st.warning(f"선택된 MMSI가 {df['mmsi'].nunique()}개라 궤적이 너무 복잡해집니다. "
+                  f"{TRAJ_MMSI_LIMIT}개 이하로 선택해주세요.")
+    else:
+        traj = df.sort_values("vsi_time")
+        color_by_mmsi = traj["mmsi"].nunique() > 1
+        st.plotly_chart(charts.trajectory_time_series(traj, color_by_mmsi),
+                        use_container_width=True)
+        st.caption("위(거리)·아래(RSSI) 그래프는 같은 시간축을 공유합니다. 같은 시각(x좌표)에서 "
+                  "두 그래프를 같이 보면서, 거리가 줄어들 때 RSSI도 세지는지(정상) 확인해보세요.")

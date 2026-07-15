@@ -126,3 +126,38 @@ def signal_validity_scatter(sample_df, baseline_df, reg_stats, fspl_fn, tx_power
     fig.update_layout(template=_TEMPLATE, height=550, margin=dict(t=30, b=0, l=0, r=0),
                       legend=dict(orientation="h", y=1.08))
     return fig
+
+
+def trajectory_time_series(df, color_by_mmsi: bool = True):
+    """시간(vsi_time) 축을 공유하는 2단 그래프: 위=거리(km), 아래=RSSI.
+    같은 x좌표(시각)에서 위/아래를 같이 보면 "거리가 줄 때 신호가 세지는지"를 바로 비교할 수 있다.
+    df 는 vsi_time 오름차순 정렬되어 있어야 하고, columns=[vsi_time, mmsi, dist_km, vsi_rssi] 필요.
+    """
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("거리 (km)", "RSSI"))
+
+    palette = px.colors.qualitative.Plotly
+    mmsi_list = list(df["mmsi"].unique()) if color_by_mmsi else [None]
+    for i, m in enumerate(mmsi_list):
+        sub = df[df["mmsi"] == m] if color_by_mmsi else df
+        color = palette[i % len(palette)]
+        name = str(m) if color_by_mmsi else "선택 MMSI"
+        fig.add_trace(go.Scattergl(
+            x=sub["vsi_time"], y=sub["dist_km"], mode="lines+markers", name=name,
+            legendgroup=name, line=dict(color=color, width=1), marker=dict(size=3),
+        ), row=1, col=1)
+        fig.add_trace(go.Scattergl(
+            x=sub["vsi_time"], y=sub["vsi_rssi"], mode="lines+markers", name=name,
+            legendgroup=name, showlegend=False,
+            line=dict(color=color, width=1), marker=dict(size=3),
+        ), row=2, col=1)
+
+    fig.update_yaxes(title_text="거리 (km)", row=1, col=1)
+    fig.update_yaxes(title_text="RSSI", row=2, col=1)
+    fig.update_xaxes(title_text="수신시각 (VSI 기준)", row=2, col=1)
+    fig.update_layout(template=_TEMPLATE, height=650, margin=dict(t=40, b=0, l=0, r=0),
+                      legend=dict(orientation="h", y=1.06),
+                      legend_title_text="MMSI" if color_by_mmsi else None)
+    return fig

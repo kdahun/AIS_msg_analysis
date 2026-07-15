@@ -264,7 +264,8 @@ def _explorer_where(msg_types, mmsis, start, end):
 # 받아 거리구간별 baseline/이상치를 계산한다.
 def load_dynamic_positions(mmsis: list[int] | None = None) -> pd.DataFrame:
     """Type 1/3 동적 위치보고 + 수신국 기준 거리(dist_m). UNIV_START 이후만 대상.
-    columns=[source_id, recv_time, mmsi, msg_type, lon, lat, vsi_rssi, vsi_snr, dist_m]
+    vsi_time 은 recv_time 대신 시간순 궤적을 그릴 때 쓰는 정밀 시각(points() 와 동일 방식).
+    columns=[source_id, vsi_time, recv_time, mmsi, msg_type, lon, lat, vsi_rssi, vsi_snr, dist_m]
     """
     haversine = f"""
         2 * 6371000 * asin(sqrt(
@@ -282,8 +283,8 @@ def load_dynamic_positions(mmsis: list[int] | None = None) -> pd.DataFrame:
     where_sql = " AND ".join(where)
 
     parts = [
-        f"""SELECT source_id, recv_time, mmsi, {mt} AS msg_type, lon, lat,
-                   vsi_rssi, vsi_snr, {haversine} AS dist_m
+        f"""SELECT source_id, {_VSI_TIME_EXPR} AS vsi_time, recv_time, mmsi,
+                   {mt} AS msg_type, lon, lat, vsi_rssi, vsi_snr, {haversine} AS dist_m
             FROM {tbl} WHERE {where_sql}"""
         for tbl, mt in (("ais_msg_1", 1), ("ais_msg_3", 3))
     ]
