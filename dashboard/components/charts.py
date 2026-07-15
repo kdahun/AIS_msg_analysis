@@ -56,17 +56,22 @@ def box_by_type(stats_df, metric: str):
 
 
 def scatter_over_time(df, y_col: str, y_label: str, color_by_mmsi: bool = True):
-    """개별 메시지 값의 시간별 산점도(WebGL, 집계 없이 원본 그대로).
-    df columns=[recv_time, mmsi, y_col]
-    color_by_mmsi: MMSI 여러 개 선택 시 색으로 구분 (너무 많으면 호출 측에서 False 로 끄는 걸 권장)
+    """개별 메시지 값을 시간순으로 선으로 이은 그래프(WebGL, 집계 없이 원본 그대로).
+    df 는 반드시 x축 컬럼(vsi_time) 기준 오름차순 정렬되어 있어야 선이 올바르게 이어진다
+    (core.queries.points() 가 이미 정렬해서 반환함).
+    df columns=[vsi_time, mmsi, y_col]
+    color_by_mmsi: MMSI 여러 개 선택 시 색으로 구분 (너무 많으면 호출 측에서 False 로 끄는 걸 권장).
+                  여러 MMSI 가 섞여도 px 가 MMSI 별로 트레이스를 나누므로 선은 같은 배(MMSI) 안에서만 이어진다.
     """
     fig = px.scatter(
-        df, x="recv_time", y=y_col,
+        df, x="vsi_time", y=y_col,
         color=df["mmsi"].astype(str) if color_by_mmsi else None,
-        labels={"recv_time": "수신시각", y_col: y_label, "color": "MMSI"},
+        labels={"vsi_time": "수신시각(VSI 기준)", y_col: y_label, "color": "MMSI"},
         template=_TEMPLATE, render_mode="webgl",
     )
-    fig.update_traces(marker=dict(size=4, opacity=0.55))
+    fig.update_traces(mode="lines+markers",
+                      marker=dict(size=3, opacity=0.6),
+                      line=dict(width=1))
     fig.update_layout(margin=dict(t=30, b=0, l=0, r=0),
                       legend_title_text="MMSI" if color_by_mmsi else None,
                       showlegend=color_by_mmsi)

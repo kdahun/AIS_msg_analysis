@@ -12,7 +12,9 @@ COLOR_MMSI_LIMIT = 12          # 이 이상 MMSI 가 섞이면 색 구분 대신
 
 def render():
     st.subheader("시간별 RSSI / SNR 추이")
-    st.caption("평균이 아니라 메시지 하나하나의 실제 RSSI/SNR 값을 시간축에 그대로 표시합니다.")
+    st.caption("평균이 아니라 메시지 하나하나의 실제 RSSI/SNR 값을 시간순으로 이어서 표시합니다. "
+              "정렬 기준은 recv_time(뭉쳐 찍힐 수 있음)이 아니라 VSI 의 시/분/초(수신기가 "
+              "메시지마다 개별적으로 기록하는 정밀 시각)입니다.")
 
     mode = st.radio("표시 방식", ["개별 값 (원본)", "시간 평균(버킷)"],
                     horizontal=True, key="bytime_mode")

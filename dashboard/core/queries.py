@@ -128,28 +128,44 @@ def count_points(start, end, mmsis: list[int] | None = None,
     return int(df.iloc[0]["n"])
 
 
+# recv_time(컬럼0, KST)은 메시지가 몰리는 구간에서 여러 메시지가 같은 값으로 뭉쳐 찍힌다
+# (로거가 버퍼를 읽어들이는 시점 기준이라 배치 단위로 갱신됨). 반면 VSI 의 시/분/초(TOA)는
+# 수신기가 메시지마다 개별적으로 찍는 정밀 시각(UTC)이라 실제 도착 순서를 더 정확히 반영한다.
+# VSI 는 시각(HH:MM:SS.ffffff)만 있고 날짜가 없으므로, recv_time 을 UTC로 환산한 날짜와
+# 결합해 정밀 타임스탬프를 만들고 다시 KST 로 되돌려 recv_time 과 같은 기준으로 표시한다.
+_VSI_TIME_EXPR = """
+    COALESCE(
+        date(recv_time - interval '9 hours')
+          + make_interval(hours => vsi_hour, mins => vsi_minute, secs => vsi_second)
+          + interval '9 hours',
+        recv_time
+    )
+"""
+
+
 def points(start, end, mmsis: list[int] | None = None,
           msg_types: list[int] | None = None,
           limit: int = 50_000) -> tuple[pd.DataFrame, int]:
-    """개별 메시지의 RSSI/SNR 원본 값(집계 없음).
-    조건에 맞는 총 건수가 limit 을 넘으면 시간순으로 균등한 간격 표본을 추출한다
+    """개별 메시지의 RSSI/SNR 원본 값(집계 없음). VSI 시각(vsi_time) 기준으로 정렬한다.
+    조건에 맞는 총 건수가 limit 을 넘으면 그 시간순으로 균등한 간격 표본을 추출한다
     (앞부분만 자르지 않고 전체 구간에 고르게 분포하도록 MOD 기반 표본 사용).
 
-    반환: (DataFrame[recv_time, mmsi, msg_type, vsi_rssi, vsi_snr], 전체 건수)
+    반환: (DataFrame[vsi_time, recv_time, mmsi, msg_type, vsi_rssi, vsi_snr], 전체 건수)
     """
     where_sql, params = _vsi_where(start, end, mmsis, msg_types)
     total = count_points(start, end, mmsis, msg_types)
     if total == 0:
-        cols = ["recv_time", "mmsi", "msg_type", "vsi_rssi", "vsi_snr"]
+        cols = ["vsi_time", "recv_time", "mmsi", "msg_type", "vsi_rssi", "vsi_snr"]
         return pd.DataFrame(columns=cols), 0
 
     if total <= limit:
         df = run_query(
             f"""
-            SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
+            SELECT {_VSI_TIME_EXPR} AS vsi_time,
+                   recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
             FROM {VIEW}
             WHERE {where_sql}
-            ORDER BY recv_time
+            ORDER BY vsi_time
             """,
             params,
         )
@@ -160,14 +176,17 @@ def points(start, end, mmsis: list[int] | None = None,
     params["stride"] = stride
     df = run_query(
         f"""
-        SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr FROM (
-            SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr,
-                   ROW_NUMBER() OVER (ORDER BY recv_time) AS rn
+        WITH base AS (
+            SELECT {_VSI_TIME_EXPR} AS vsi_time,
+                   recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
             FROM {VIEW}
             WHERE {where_sql}
+        )
+        SELECT vsi_time, recv_time, mmsi, msg_type, vsi_rssi, vsi_snr FROM (
+            SELECT *, ROW_NUMBER() OVER (ORDER BY vsi_time) AS rn FROM base
         ) t
         WHERE MOD(rn, :stride) = 0
-        ORDER BY recv_time
+        ORDER BY vsi_time
         """,
         params,
     )
