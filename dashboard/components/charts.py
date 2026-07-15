@@ -87,3 +87,42 @@ def scatter_rssi_snr(df):
     fig.update_layout(template=_TEMPLATE, xaxis_title="RSSI", yaxis_title="SNR",
                       margin=dict(t=30, b=0, l=0, r=0))
     return fig
+
+
+def signal_validity_scatter(sample_df, baseline_df, reg_stats, fspl_fn, tx_power_dbm):
+    """거리(log) vs RSSI: 실측 표본 + 경험적 baseline + FSPL 이론 + 실측회귀 비교.
+    sample_df columns=[dist_km, vsi_rssi] (표시용 표본, 이미 다운샘플되어 있다고 가정)
+    baseline_df columns=[bin_center_km, rssi_median]
+    """
+    import numpy as np
+
+    d_min = min(sample_df["dist_km"].min(), baseline_df["bin_center_km"].min())
+    d_max = max(sample_df["dist_km"].max(), baseline_df["bin_center_km"].max())
+    d_line = np.linspace(d_min, d_max, 200)
+    log_d_line = np.log10(d_line)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scattergl(
+        x=sample_df["dist_km"], y=sample_df["vsi_rssi"], mode="markers",
+        marker=dict(size=3, opacity=0.25, color="#4C9BE8"), name="실측 RSSI(표본)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=baseline_df["bin_center_km"], y=baseline_df["rssi_median"],
+        mode="lines+markers", name="경험적 baseline(구간 중앙값)",
+        line=dict(color="#E8A33D", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=d_line, y=tx_power_dbm - fspl_fn(d_line),
+        mode="lines", name="FSPL 이론(12.5W 가정)",
+        line=dict(color="#FF6B6B", width=2, dash="dash"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=d_line, y=reg_stats["intercept"] + reg_stats["slope"] * log_d_line,
+        mode="lines", name=f"실측 회귀({reg_stats['slope']:.1f}dB/decade)",
+        line=dict(color="#5CD65C", width=2, dash="dot"),
+    ))
+    fig.update_xaxes(type="log", title="거리 (km, log scale)")
+    fig.update_yaxes(title="RSSI")
+    fig.update_layout(template=_TEMPLATE, height=550, margin=dict(t=30, b=0, l=0, r=0),
+                      legend=dict(orientation="h", y=1.08))
+    return fig

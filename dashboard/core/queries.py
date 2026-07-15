@@ -6,7 +6,7 @@ import math
 import pandas as pd
 
 from core.db import run_query
-from core.constants import VIEW, RAW_TABLE
+from core.constants import VIEW, RAW_TABLE, RX_LAT, RX_LON, UNIV_START
 
 
 # ── 공통 조회 ────────────────────────────────────────────────
@@ -256,3 +256,35 @@ def _explorer_where(msg_types, mmsis, start, end):
         where.append("v.mmsi = ANY(:mmsis)")
         params["mmsis"] = list(mmsis)
     return " AND ".join(where), params
+
+
+# ── 탭 4: 신호 유효성 (위치 기반) ─────────────────────────────
+# 수신국(RX_LAT/RX_LON)이 확정된 구간(UNIV_START 이후)의 Type 1/3 동적 위치보고만 대상으로,
+# Haversine 으로 수신국까지 거리(dist_m)를 계산해 반환한다. core.signal_model 이 이 결과를
+# 받아 거리구간별 baseline/이상치를 계산한다.
+def load_dynamic_positions(mmsis: list[int] | None = None) -> pd.DataFrame:
+    """Type 1/3 동적 위치보고 + 수신국 기준 거리(dist_m). UNIV_START 이후만 대상.
+    columns=[source_id, recv_time, mmsi, msg_type, lon, lat, vsi_rssi, vsi_snr, dist_m]
+    """
+    haversine = f"""
+        2 * 6371000 * asin(sqrt(
+            power(sin(radians(lat - {RX_LAT}) / 2), 2) +
+            cos(radians({RX_LAT})) * cos(radians(lat)) *
+            power(sin(radians(lon - {RX_LON}) / 2), 2)
+        ))
+    """
+    where = ["recv_time >= :univ_start",
+             "lon BETWEEN -180 AND 180", "lat BETWEEN -90 AND 90"]
+    params = {"univ_start": UNIV_START}
+    if mmsis:
+        where.append("mmsi = ANY(:mmsis)")
+        params["mmsis"] = list(mmsis)
+    where_sql = " AND ".join(where)
+
+    parts = [
+        f"""SELECT source_id, recv_time, mmsi, {mt} AS msg_type, lon, lat,
+                   vsi_rssi, vsi_snr, {haversine} AS dist_m
+            FROM {tbl} WHERE {where_sql}"""
+        for tbl, mt in (("ais_msg_1", 1), ("ais_msg_3", 3))
+    ]
+    return run_query(" UNION ALL ".join(parts), params)

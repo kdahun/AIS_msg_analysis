@@ -6,10 +6,11 @@
 
 app.py 는 이 목록만 보고 탭을 그리므로 수정할 필요가 없다.
 """
-from . import rssi_snr_by_mmsi, rssi_snr_by_time, rssi_snr_by_message
+from . import rssi_snr_by_mmsi, rssi_snr_by_time, rssi_snr_by_message, signal_validity
 
 TABS = [
     rssi_snr_by_mmsi,
     rssi_snr_by_time,
     rssi_snr_by_message,
+    signal_validity,
 ]

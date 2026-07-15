@@ -35,3 +35,13 @@ def msg_label(msg_type):
     """예: '1 - Position Report Class A (SOTDMA)'"""
     name = MSG_NAMES.get(msg_type, f"Type {msg_type}")
     return f"{msg_type} - {name}"
+
+
+# ── 신호 유효성(위치 기반) 분석용 ──────────────────────────────
+# 국립한국해양대학교 아치캠퍼스 (수신국 좌표, 사용자 제공)
+RX_LAT = 35.0805
+RX_LON = 129.0886
+
+# 위 좌표가 유효한 구간의 시작 시각. 이전 구간은 "바다 근처 모텔"에서 수집되어
+# 수신국 좌표를 모르므로 위치 기반 신호 검증 대상에서 제외한다.
+UNIV_START = "2026-06-10 10:33:23"
