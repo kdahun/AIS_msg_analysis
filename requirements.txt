@@ -10,6 +10,9 @@ openpyxl
 # AIS message parsing
 pyais
 
+# PostgreSQL
+psycopg2-binary
+
 # Visualization
 matplotlib
 seaborn
