@@ -143,29 +143,30 @@ def _render_slot_map(df):
                   "(거리는 전 구간 한국해양대 좌표 기준, 모텔 구간은 근사값)")
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-    _render_context_lines(df, sel_ts)
+    _render_context_lines(df, sel_ts, fdf)
 
 
-CONTEXT_MMSI_LIMIT = 10   # 선그래프에 동시에 그릴 MMSI 상한
-
-
-def _render_context_lines(df, sel_ts):
-    """선택 MMSI(들)의 RSSI/SNR/거리 시간추이 선그래프 + 현재 프레임 시점 표시."""
+def _render_context_lines(df, sel_ts, fdf):
+    """현재 프레임에서 송신한 선박 전체의 RSSI/SNR/거리 시간추이.
+    정상 선박은 반투명 파란 선(주변 환경), 이 프레임 위반 선박은 주황/색 강조.
+    → 위반 시점 주변의 전체 신호 환경(이웃 선박 잡음비 등)과 대조해 원인을 유추할 수 있다.
+    """
     st.markdown("#### 시점별 상황 — RSSI · SNR · 거리 선그래프")
-    n_mmsi = df["mmsi"].nunique()
-    if n_mmsi > CONTEXT_MMSI_LIMIT:
-        st.info(
-            f"위 'MMSI 필터'에서 선박을 {CONTEXT_MMSI_LIMIT}개 이하로 선택하면, 그 선박의 "
-            "RSSI/SNR/거리 시간추이 선그래프가 표시됩니다. 현재 보고 있는 프레임 시점이 "
-            "주황 세로선으로 표시되어, 위반이 난 슬롯 시점에 신호·거리가 어떤 상황이었는지 "
-            "함께 확인할 수 있습니다."
-        )
-        return
 
-    traj = df.sort_values("vsi_time")
-    st.caption(f"주황 세로선 = 현재 슬롯맵에서 보고 있는 프레임({sel_ts:%m-%d %H:%M}) 시점. "
-              "거리는 전 구간 한국해양대 좌표 기준입니다 (모텔 구간(06-10 10:33 이전)은 "
-              "실제 수신 위치가 달라 근사값).")
+    win_min = st.slider("시간 창 (현재 프레임 ± 분)", 2, 30, 10, key="rc_ctx_win")
+    lo = sel_ts - pd.Timedelta(minutes=win_min)
+    hi = sel_ts + pd.Timedelta(minutes=win_min + 1)
+
+    vessels_in_frame = fdf["mmsi"].unique()
+    window_df = df[df["mmsi"].isin(vessels_in_frame) & df["vsi_time"].between(lo, hi)]
+    violators = set(fdf.loc[fdf["is_violation"], "mmsi"])
+
+    st.caption(
+        f"현재 프레임({sel_ts:%m-%d %H:%M})에서 송신한 **{len(vessels_in_frame)}척 전체**의 "
+        f"±{win_min}분 추이. 파란 반투명 선=정상 선박(주변 환경), 색/주황 선=이 프레임 "
+        f"위반 선박({len(violators)}척). 주황 세로선=현재 프레임 시점. 선에 마우스를 올리면 "
+        "MMSI 가 표시됩니다. 거리는 전 구간 한국해양대 좌표 기준(모텔 구간은 근사값)."
+    )
     st.plotly_chart(
-        charts.context_lines(traj, sel_ts, color_by_mmsi=n_mmsi > 1),
+        charts.context_lines_frame(window_df, sel_ts, violators),
         use_container_width=True, key="rc_context_lines")

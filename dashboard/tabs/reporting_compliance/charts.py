@@ -98,39 +98,72 @@ def channel_slot_map(channel_df, channel: str):
     return fig
 
 
-def context_lines(vessel_df, frame_ts, color_by_mmsi=True):
-    """선박(들)의 RSSI/SNR/거리 시간추이 선그래프 3단 (시간축 공유).
-    현재 보고 있는 프레임 시점(frame_ts)을 세로 점선으로 표시한다.
-    vessel_df: vsi_time 오름차순, columns=[vsi_time, mmsi, vsi_rssi, vsi_snr, dist_km]
+_METRICS = [("vsi_rssi", "RSSI"), ("vsi_snr", "SNR"), ("dist_km", "거리 (km, 한국해양대 기준)")]
+
+
+def _merged_line(sub_df, col, color, name, showlegend):
+    """여러 MMSI 의 궤적을 None 구분자로 이어붙인 단일 trace (수백 척도 가볍게 렌더).
+    hover 에 MMSI 표시."""
+    xs, ys, cds = [], [], []
+    for m, g in sub_df.groupby("mmsi"):
+        g = g.sort_values("vsi_time")
+        xs.extend(g["vsi_time"].tolist()); xs.append(None)
+        ys.extend(g[col].tolist()); ys.append(None)
+        cds.extend([m] * len(g)); cds.append(None)
+    return go.Scattergl(
+        x=xs, y=ys, customdata=cds, mode="lines", name=name,
+        legendgroup=name, showlegend=showlegend,
+        line=dict(color=color, width=1),
+        hovertemplate="MMSI %{customdata}<br>%{y}<extra></extra>")
+
+
+def context_lines_frame(window_df, frame_ts, violator_mmsis, max_legend=12):
+    """현재 프레임에서 송신한 선박 전체의 RSSI/SNR/거리 시간추이 (프레임 주변 시간창).
+
+    - 일반 선박: 얇은 반투명 파란 선(배경 = 주변 신호 환경 전체 상황)
+    - 이 프레임에서 위반한 선박: 주황 강조 (max_legend 이하면 개별 색+범례)
+    - 현재 프레임 시점: 주황 세로선/영역
+    window_df: columns=[vsi_time, mmsi, vsi_rssi, vsi_snr, dist_km]
     """
     from plotly.subplots import make_subplots
     import plotly.express as px
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        subplot_titles=("RSSI", "SNR", "거리 (km, 한국해양대 기준)"))
+                        subplot_titles=tuple(t for _, t in _METRICS))
 
-    palette = px.colors.qualitative.Plotly
-    mmsi_list = list(vessel_df["mmsi"].unique()) if color_by_mmsi else [None]
-    for i, m in enumerate(mmsi_list):
-        sub = vessel_df[vessel_df["mmsi"] == m] if color_by_mmsi else vessel_df
-        color = palette[i % len(palette)]
-        name = str(m) if color_by_mmsi else "선택 선박"
-        common = dict(mode="lines+markers", legendgroup=name,
-                      line=dict(color=color, width=1), marker=dict(size=3))
-        fig.add_trace(go.Scattergl(x=sub["vsi_time"], y=sub["vsi_rssi"],
-                                   name=name, **common), row=1, col=1)
-        fig.add_trace(go.Scattergl(x=sub["vsi_time"], y=sub["vsi_snr"],
-                                   name=name, showlegend=False, **common), row=2, col=1)
-        fig.add_trace(go.Scattergl(x=sub["vsi_time"], y=sub["dist_km"],
-                                   name=name, showlegend=False, **common), row=3, col=1)
+    normal = window_df[~window_df["mmsi"].isin(violator_mmsis)]
+    viol = window_df[window_df["mmsi"].isin(violator_mmsis)]
+
+    for row, (col, _title) in enumerate(_METRICS, start=1):
+        if len(normal):
+            fig.add_trace(_merged_line(normal, col, "rgba(77,159,236,0.35)",
+                                       "정상 선박(주변 환경)", showlegend=(row == 1)),
+                          row=row, col=1)
+
+    v_list = sorted(viol["mmsi"].unique())
+    if len(v_list) <= max_legend:
+        palette = px.colors.qualitative.Plotly
+        for i, m in enumerate(v_list):
+            sub = viol[viol["mmsi"] == m].sort_values("vsi_time")
+            color = palette[i % len(palette)]
+            for row, (col, _t) in enumerate(_METRICS, start=1):
+                fig.add_trace(go.Scattergl(
+                    x=sub["vsi_time"], y=sub[col], mode="lines+markers",
+                    name=f"위반: {m}", legendgroup=str(m), showlegend=(row == 1),
+                    line=dict(color=color, width=2), marker=dict(size=4)),
+                    row=row, col=1)
+    elif len(v_list):
+        for row, (col, _t) in enumerate(_METRICS, start=1):
+            fig.add_trace(_merged_line(viol, col, "#F2A33C",
+                                       f"위반 선박 {len(v_list)}척", showlegend=(row == 1)),
+                          row=row, col=1)
 
     fig.add_vrect(x0=frame_ts, x1=frame_ts + pd.Timedelta(minutes=1),
                   fillcolor="#E8A33D", opacity=0.25, line_width=0)
     fig.add_vline(x=frame_ts, line=dict(color="#E8A33D", width=1.5, dash="dash"))
 
     fig.update_xaxes(title_text="수신시각 (VSI 기준)", row=3, col=1)
-    fig.update_layout(template=_TEMPLATE, height=560,
+    fig.update_layout(template=_TEMPLATE, height=620,
                       margin=dict(t=40, b=0, l=0, r=0),
-                      legend=dict(orientation="h", y=1.06),
-                      legend_title_text="MMSI" if color_by_mmsi else None)
+                      legend=dict(orientation="h", y=1.05))
     return fig
