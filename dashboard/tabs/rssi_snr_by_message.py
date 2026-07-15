@@ -30,8 +30,9 @@ def render():
     st.caption("모든 메시지를 필터·페이지 단위로 조회합니다. (원문 AIS/VSI 포함)")
 
     msg_types = filters.msg_type_multiselect("bymsg")
-    mmsis = filters.mmsi_multiselect("bymsg", label="MMSI 필터 (선택 안 하면 전체)")
-    start, end = filters.time_range("bymsg")
+    mmsis = filters.mmsi_multiselect(
+        "bymsg", label="MMSI 필터 — 선택하면 아래 시간 범위가 해당 MMSI 기준으로 자동 조정됩니다")
+    start, end = filters.time_range("bymsg", mmsis=mmsis or None)
 
     total = queries.count_messages(msg_types or None, mmsis or None, start, end)
     n_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)

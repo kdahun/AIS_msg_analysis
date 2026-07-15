@@ -55,6 +55,24 @@ def box_by_type(stats_df, metric: str):
     return fig
 
 
+def scatter_over_time(df, y_col: str, y_label: str, color_by_mmsi: bool = True):
+    """개별 메시지 값의 시간별 산점도(WebGL, 집계 없이 원본 그대로).
+    df columns=[recv_time, mmsi, y_col]
+    color_by_mmsi: MMSI 여러 개 선택 시 색으로 구분 (너무 많으면 호출 측에서 False 로 끄는 걸 권장)
+    """
+    fig = px.scatter(
+        df, x="recv_time", y=y_col,
+        color=df["mmsi"].astype(str) if color_by_mmsi else None,
+        labels={"recv_time": "수신시각", y_col: y_label, "color": "MMSI"},
+        template=_TEMPLATE, render_mode="webgl",
+    )
+    fig.update_traces(marker=dict(size=4, opacity=0.55))
+    fig.update_layout(margin=dict(t=30, b=0, l=0, r=0),
+                      legend_title_text="MMSI" if color_by_mmsi else None,
+                      showlegend=color_by_mmsi)
+    return fig
+
+
 def scatter_rssi_snr(df):
     """RSSI vs SNR 산점도(WebGL). df columns=[vsi_rssi, vsi_snr, ...]"""
     fig = go.Figure(go.Scattergl(

@@ -24,12 +24,18 @@ def msg_type_multiselect(prefix: str, label: str = "메시지 타입"):
     return [mapping[p] for p in picked]
 
 
-def time_range(prefix: str):
-    """전체 데이터 범위를 기본값으로 하는 시작/끝 시각 선택. 반환: (start, end)."""
-    lo, hi = queries.get_time_bounds()
+def time_range(prefix: str, mmsis: list[int] | None = None):
+    """시작/끝 시각 선택. 반환: (start, end).
+
+    mmsis 를 주면 그 MMSI(들)의 실제 수신 시간 범위로 슬라이더의 최소/최대/기본값이
+    맞춰진다. MMSI 선택이 바뀌면(위젯 key 에 mmsis 를 포함시켜) 슬라이더가 새로
+    초기화되어 새 범위의 시작~끝으로 자동 조정된다.
+    """
+    lo, hi = queries.get_time_bounds(mmsis)
+    scope = "_".join(str(m) for m in sorted(mmsis)) if mmsis else "all"
     c1, c2 = st.columns(2)
     start = c1.slider("시작", min_value=lo.to_pydatetime(), max_value=hi.to_pydatetime(),
-                      value=lo.to_pydatetime(), key=f"{prefix}_start", format="MM-DD HH:mm")
+                      value=lo.to_pydatetime(), key=f"{prefix}_start_{scope}", format="MM-DD HH:mm")
     end = c2.slider("끝", min_value=lo.to_pydatetime(), max_value=hi.to_pydatetime(),
-                    value=hi.to_pydatetime(), key=f"{prefix}_end", format="MM-DD HH:mm")
+                    value=hi.to_pydatetime(), key=f"{prefix}_end_{scope}", format="MM-DD HH:mm")
     return start, end

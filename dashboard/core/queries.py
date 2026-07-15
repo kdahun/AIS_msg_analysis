@@ -1,6 +1,8 @@
 """재사용 쿼리 함수 모음. 모두 통합 뷰 v_vsi(+ 원문 테이블)를 대상으로 하며,
 집계는 최대한 DB(Postgres)에서 처리해 브라우저로는 작은 결과만 보낸다.
 """
+import math
+
 import pandas as pd
 
 from core.db import run_query
@@ -8,9 +10,16 @@ from core.constants import VIEW, RAW_TABLE
 
 
 # ── 공통 조회 ────────────────────────────────────────────────
-def get_time_bounds():
-    """전체 데이터의 최소/최대 수신시각."""
-    df = run_query(f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {VIEW}")
+def get_time_bounds(mmsis: list[int] | None = None):
+    """최소/최대 수신시각. mmsis 를 주면 그 MMSI(들)로 한정된 범위를 반환한다."""
+    if mmsis:
+        df = run_query(
+            f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {VIEW} "
+            f"WHERE mmsi = ANY(:mmsis)",
+            {"mmsis": list(mmsis)},
+        )
+    else:
+        df = run_query(f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {VIEW}")
     return df.iloc[0]["lo"], df.iloc[0]["hi"]
 
 
@@ -75,22 +84,28 @@ def dist_by_mmsi(mmsis: list[int], metric: str) -> pd.DataFrame:
 
 
 # ── 탭 2: 시간별 ─────────────────────────────────────────────
-def timeseries(bucket: str, start, end,
-               mmsis: list[int] | None = None,
-               msg_types: list[int] | None = None) -> pd.DataFrame:
-    """시간 버킷(minute/hour)별 RSSI/SNR 평균 + 건수.
-    columns=[ts, n, rssi_avg, snr_avg]
-    """
-    assert bucket in ("minute", "hour")
+def _vsi_where(start, end, mmsis: list[int] | None = None,
+               msg_types: list[int] | None = None):
     where = ["recv_time BETWEEN :start AND :end"]
-    params = {"start": start, "end": end, "bucket": bucket}
+    params = {"start": start, "end": end}
     if mmsis:
         where.append("mmsi = ANY(:mmsis)")
         params["mmsis"] = list(mmsis)
     if msg_types:
         where.append("msg_type = ANY(:mtypes)")
         params["mtypes"] = list(msg_types)
-    where_sql = " AND ".join(where)
+    return " AND ".join(where), params
+
+
+def timeseries(bucket: str, start, end,
+               mmsis: list[int] | None = None,
+               msg_types: list[int] | None = None) -> pd.DataFrame:
+    """시간 버킷(minute/hour)별 RSSI/SNR 평균 + 건수. (참고용 — 기본은 points() 개별값 표시)
+    columns=[ts, n, rssi_avg, snr_avg]
+    """
+    assert bucket in ("minute", "hour")
+    where_sql, params = _vsi_where(start, end, mmsis, msg_types)
+    params["bucket"] = bucket
     return run_query(
         f"""
         SELECT date_trunc(:bucket, recv_time) AS ts,
@@ -103,6 +118,60 @@ def timeseries(bucket: str, start, end,
         """,
         params,
     )
+
+
+def count_points(start, end, mmsis: list[int] | None = None,
+                 msg_types: list[int] | None = None) -> int:
+    """조건에 맞는 개별 메시지(행) 총 건수."""
+    where_sql, params = _vsi_where(start, end, mmsis, msg_types)
+    df = run_query(f"SELECT COUNT(*) AS n FROM {VIEW} WHERE {where_sql}", params)
+    return int(df.iloc[0]["n"])
+
+
+def points(start, end, mmsis: list[int] | None = None,
+          msg_types: list[int] | None = None,
+          limit: int = 50_000) -> tuple[pd.DataFrame, int]:
+    """개별 메시지의 RSSI/SNR 원본 값(집계 없음).
+    조건에 맞는 총 건수가 limit 을 넘으면 시간순으로 균등한 간격 표본을 추출한다
+    (앞부분만 자르지 않고 전체 구간에 고르게 분포하도록 MOD 기반 표본 사용).
+
+    반환: (DataFrame[recv_time, mmsi, msg_type, vsi_rssi, vsi_snr], 전체 건수)
+    """
+    where_sql, params = _vsi_where(start, end, mmsis, msg_types)
+    total = count_points(start, end, mmsis, msg_types)
+    if total == 0:
+        cols = ["recv_time", "mmsi", "msg_type", "vsi_rssi", "vsi_snr"]
+        return pd.DataFrame(columns=cols), 0
+
+    if total <= limit:
+        df = run_query(
+            f"""
+            SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
+            FROM {VIEW}
+            WHERE {where_sql}
+            ORDER BY recv_time
+            """,
+            params,
+        )
+        return df, total
+
+    # 올림 나눗셈: 내림(//)을 쓰면 stride 가 작게 잡혀 결과가 limit 을 넘어설 수 있다.
+    stride = max(1, math.ceil(total / limit))
+    params["stride"] = stride
+    df = run_query(
+        f"""
+        SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr FROM (
+            SELECT recv_time, mmsi, msg_type, vsi_rssi, vsi_snr,
+                   ROW_NUMBER() OVER (ORDER BY recv_time) AS rn
+            FROM {VIEW}
+            WHERE {where_sql}
+        ) t
+        WHERE MOD(rn, :stride) = 0
+        ORDER BY recv_time
+        """,
+        params,
+    )
+    return df, total
 
 
 # ── 탭 3: 메시지별 (전체 메시지 탐색) ────────────────────────
