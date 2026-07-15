@@ -23,15 +23,29 @@ docker exec -i postgis-container psql -U sim_user -d ais_analysis_db < sql/creat
 `CREATE OR REPLACE VIEW`라 여러 번 실행해도 안전합니다.
 
 ### 1-3. 접속정보 설정
-`.streamlit/secrets.toml`에 DB 접속정보를 넣습니다 (이 파일은 `.gitignore`로 커밋에서 제외됨).
+`secrets.toml`은 비밀번호를 담고 있어 `.gitignore`로 커밋에서 제외됩니다.
+**새 PC에서는 반드시 직접 만들어야 합니다** (없으면 `StreamlitSecretNotFoundError` 발생).
+
+저장소에 포함된 템플릿을 복사해서 값만 채우면 됩니다:
+```bash
+cd dashboard
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+# 편집기로 열어 password 등 실제 값 입력
+```
 ```toml
 [postgres]
-host = "localhost"
+host = "localhost"      # DB 가 다른 PC/도커에 있으면 그 IP 로 변경
 port = 5432
 user = "sim_user"
 password = "********"
 dbname = "ais_analysis_db"
 ```
+
+> **또는 환경변수로도 설정 가능** (secrets.toml 없이):
+> `AIS_DB_HOST`, `AIS_DB_PORT`, `AIS_DB_USER`, `AIS_DB_PASSWORD`, `AIS_DB_NAME`
+
+> ⚠️ **DB 위치 주의**: DB(`postgis-container`)가 다른 PC의 Docker에 떠 있다면 Mac 에서 `localhost`
+> 로는 접속되지 않습니다. 그 PC 의 IP 로 `host` 를 바꾸고 5432 포트가 네트워크에 열려 있어야 합니다.
 
 ---
 
