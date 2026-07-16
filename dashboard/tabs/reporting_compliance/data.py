@@ -58,3 +58,16 @@ def get_enriched() -> pd.DataFrame:
     df["dist_km"] = np.where(valid_pos, _haversine_km(df["lat"], df["lon"]), np.nan)
 
     return logic.enrich_all(df)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_noise_floor() -> pd.DataFrame:
+    """분(프레임) 단위 잡음층 시계열. 전체 수신 메시지의 (RSSI − SNR) 중앙값.
+
+    수신기는 SNR = RSSI − 잡음층 으로 계산하므로 RSSI − SNR 이 그 시점의
+    주변 잡음층(dBm)이 된다. 중앙값을 써서 개별 측정 편차(±5dB)에 흔들리지
+    않는 안정적 기준선을 만든다. columns=[frame, noise_dbm]
+    """
+    df = get_enriched()
+    nf = (df["vsi_rssi"] - df["vsi_snr"]).groupby(df["frame"]).median()
+    return nf.rename("noise_dbm").reset_index()

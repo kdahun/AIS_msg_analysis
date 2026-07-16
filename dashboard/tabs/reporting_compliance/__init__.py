@@ -25,15 +25,19 @@ def render():
     )
 
     with st.expander("판정 임계값 조절", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         slow = c1.slider("보고 지연 배율 (기대×N 초과 시 위반)", 1.2, 5.0, 2.0, 0.1,
                          key="rc_slow", help="예: 기대 10초, 배율 2.0 → 20초 초과 시 '보고 지연'")
         fast = c2.slider("과도 보고 배율 (기대×N 미만 시 위반)", 0.1, 0.9, 0.5, 0.05,
                          key="rc_fast", help="예: 기대 10초, 배율 0.5 → 5초 미만 시 '과도한 보고'")
         tol = c3.slider("슬롯 시간 허용오차 (초)", 0.1, 10.0, 5.0, 0.1, key="rc_tol",
                         help="다음 프레임(60초 뒤) 예고/반복 슬롯을 찾을 때 허용할 시간 오차")
+        margin = c4.slider("수신한계 여유 (dB)", 3.0, 20.0, 10.0, 1.0, key="rc_margin",
+                           help="선박 RSSI가 잡음층+이 값 미만이면 '수신한계 근접'으로 판정. "
+                                "AIS 복조에 통상 ~10dB SNR 이 필요")
 
     enriched = data.get_enriched()
+    noise_df = data.get_noise_floor()
     df = logic.classify(enriched, slow_factor=slow, fast_factor=fast, time_tol_sec=tol)
 
     # ── MMSI 필터 (화면 전체에 적용) ─────────────────────────
@@ -47,7 +51,7 @@ def render():
 
     _render_overview(df)
     st.divider()
-    _render_slot_map(df)
+    _render_slot_map(df, noise_df, margin)
 
 
 def _render_overview(df):
@@ -78,7 +82,7 @@ def _render_overview(df):
         st.dataframe(tbl, use_container_width=True, hide_index=True, height=360)
 
 
-def _render_slot_map(df):
+def _render_slot_map(df, noise_df, margin):
     st.markdown("#### 프레임별 슬롯맵 — 채널 A / 채널 B (각 2,250 슬롯 / 1분)")
 
     frame_list = sorted(df["frame"].dropna().unique())
@@ -127,29 +131,40 @@ def _render_slot_map(df):
 
     viol_rows = fdf[fdf["is_violation"]]
     if len(viol_rows):
+        noise_map = noise_df.set_index("frame")["noise_dbm"]
         show = viol_rows.copy()
         show["사유"] = [logic.combined_reason_ko(r, s)
                        for r, s in zip(show["ri_reason"], show["slot_reason"])]
         show["변침"] = show["changing_course"].map({True: "예", False: "아니오"})
+        # 잡음여유 = 이 메시지의 RSSI − 그 시점 잡음층. margin 미만이면 수신한계 근접
+        # (이후 메시지가 잡음에 묻혀 유실됐을 가능성 = 환경 요인으로 설명 가능한 위반)
+        show["잡음여유(dB)"] = show["vsi_rssi"] - show["frame"].map(noise_map)
+        show["환경요인?"] = show["잡음여유(dB)"].lt(margin).map(
+            {True: "예(수신한계 근접)", False: ""})
         cols_show = ["vsi_time", "mmsi", "msg_type", "channel", "vsi_slot", "사유",
-                    "speed", "heading", "변침", "vsi_rssi", "vsi_snr", "dist_km"]
+                    "환경요인?", "잡음여유(dB)", "speed", "heading", "변침",
+                    "vsi_rssi", "vsi_snr", "dist_km"]
         show = show[cols_show].rename(columns={
             "vsi_time": "시각", "mmsi": "MMSI", "msg_type": "타입", "channel": "채널",
             "vsi_slot": "슬롯", "speed": "속력(kn)", "heading": "HDG",
             "vsi_rssi": "RSSI", "vsi_snr": "SNR", "dist_km": "거리(km)",
         })
-        show = show.sort_values(["채널", "슬롯"]).round({"거리(km)": 2})
-        st.caption(f"이 프레임의 위반 내역 ({len(show)}건) — RSSI/SNR/거리로 주변 환경 확인 가능 "
+        show = show.sort_values(["채널", "슬롯"]).round({"거리(km)": 2, "잡음여유(dB)": 0})
+        env_n = int((show["환경요인?"] != "").sum())
+        st.caption(f"이 프레임의 위반 내역 ({len(show)}건, 그중 수신한계 근접 {env_n}건) — "
+                  f"잡음여유(RSSI−잡음층)가 {margin:.0f}dB 미만이면 신호가 잡음에 묻혀 "
+                  "수신 유실됐을 가능성이 높은 환경성 위반입니다 "
                   "(거리는 전 구간 한국해양대 좌표 기준, 모텔 구간은 근사값)")
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-    _render_context_lines(df, sel_ts, fdf)
+    _render_context_lines(df, sel_ts, fdf, noise_df, margin)
 
 
-def _render_context_lines(df, sel_ts, fdf):
-    """현재 프레임에서 송신한 선박 전체의 RSSI/SNR/거리 시간추이.
+def _render_context_lines(df, sel_ts, fdf, noise_df, margin):
+    """현재 프레임에서 송신한 선박 전체의 RSSI/SNR/거리 시간추이 + 잡음층.
     정상 선박은 반투명 파란 선(주변 환경), 이 프레임 위반 선박은 주황/색 강조.
-    → 위반 시점 주변의 전체 신호 환경(이웃 선박 잡음비 등)과 대조해 원인을 유추할 수 있다.
+    RSSI 패널의 빨간 점선(잡음층)과 음영 밴드(수신한계) 아래로 선박 RSSI 가
+    떨어지면 '멀어져서 신호가 잡음에 묻힌' 환경성 수신 유실로 해석할 수 있다.
     """
     st.markdown("#### 시점별 상황 — RSSI · SNR · 거리 선그래프")
 
@@ -160,13 +175,17 @@ def _render_context_lines(df, sel_ts, fdf):
     vessels_in_frame = fdf["mmsi"].unique()
     window_df = df[df["mmsi"].isin(vessels_in_frame) & df["vsi_time"].between(lo, hi)]
     violators = set(fdf.loc[fdf["is_violation"], "mmsi"])
+    noise_win = noise_df[noise_df["frame"].between(lo, hi)]
 
     st.caption(
         f"현재 프레임({sel_ts:%m-%d %H:%M})에서 송신한 **{len(vessels_in_frame)}척 전체**의 "
         f"±{win_min}분 추이. 파란 반투명 선=정상 선박(주변 환경), 색/주황 선=이 프레임 "
-        f"위반 선박({len(violators)}척). 주황 세로선=현재 프레임 시점. 선에 마우스를 올리면 "
-        "MMSI 가 표시됩니다. 거리는 전 구간 한국해양대 좌표 기준(모텔 구간은 근사값)."
+        f"위반 선박({len(violators)}척). **빨간 점선=잡음층**, 그 위 음영=수신한계 영역"
+        f"(잡음층+{margin:.0f}dB) — 선박 RSSI 선이 이 영역에 들어가면 수신이 물리적으로 "
+        "불안정합니다. 거리 패널과 같이 보면 '멀어짐→신호약화→수신유실'을 확인할 수 있습니다. "
+        "선에 마우스를 올리면 MMSI 표시. 거리는 전 구간 한국해양대 좌표 기준."
     )
     st.plotly_chart(
-        charts.context_lines_frame(window_df, sel_ts, violators),
+        charts.context_lines_frame(window_df, sel_ts, violators,
+                                   noise_df=noise_win, decode_margin=margin),
         use_container_width=True, key="rc_context_lines")

@@ -117,19 +117,42 @@ def _merged_line(sub_df, col, color, name, showlegend):
         hovertemplate="MMSI %{customdata}<br>%{y}<extra></extra>")
 
 
-def context_lines_frame(window_df, frame_ts, violator_mmsis, max_legend=12):
+def context_lines_frame(window_df, frame_ts, violator_mmsis, max_legend=12,
+                        noise_df=None, decode_margin=10.0):
     """현재 프레임에서 송신한 선박 전체의 RSSI/SNR/거리 시간추이 (프레임 주변 시간창).
 
     - 일반 선박: 얇은 반투명 파란 선(배경 = 주변 신호 환경 전체 상황)
     - 이 프레임에서 위반한 선박: 주황 강조 (max_legend 이하면 개별 색+범례)
+    - 잡음층(noise_df, 분 단위 RSSI−SNR 중앙값): RSSI 패널에 빨간 점선 +
+      '수신한계(잡음층+decode_margin dB)' 음영 밴드. 선박 RSSI 가 이 밴드에
+      들어오면 물리적으로 수신이 불안정한 상태(환경 요인 후보)
     - 현재 프레임 시점: 주황 세로선/영역
     window_df: columns=[vsi_time, mmsi, vsi_rssi, vsi_snr, dist_km]
+    noise_df: columns=[frame, noise_dbm] (이미 시간창으로 잘려 있다고 가정)
     """
     from plotly.subplots import make_subplots
     import plotly.express as px
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                         subplot_titles=tuple(t for _, t in _METRICS))
+
+    # 잡음층 + 수신한계 밴드를 먼저 깔아 배경으로 (RSSI 패널)
+    if noise_df is not None and len(noise_df):
+        nd = noise_df.sort_values("frame")
+        fig.add_trace(go.Scatter(
+            x=nd["frame"], y=nd["noise_dbm"], mode="lines",
+            name="잡음층(RSSI−SNR 중앙값)",
+            line=dict(color="#FF5C5C", width=1.5, dash="dash"),
+            hovertemplate="잡음층 %{y:.0f} dBm<extra></extra>"), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=nd["frame"], y=nd["noise_dbm"] + decode_margin, mode="lines",
+            name=f"수신한계(잡음층+{decode_margin:.0f}dB)",
+            line=dict(color="rgba(255,92,92,0.5)", width=0.5),
+            fill="tonexty", fillcolor="rgba(255,92,92,0.15)",
+            hovertemplate="수신한계 %{y:.0f} dBm<extra></extra>"), row=1, col=1)
+        # SNR 관점의 같은 기준선: SNR < decode_margin 이면 수신 불안정
+        fig.add_hline(y=decode_margin, row=2, col=1,
+                      line=dict(color="#FF5C5C", width=1, dash="dash"))
 
     normal = window_df[~window_df["mmsi"].isin(violator_mmsis)]
     viol = window_df[window_df["mmsi"].isin(violator_mmsis)]
