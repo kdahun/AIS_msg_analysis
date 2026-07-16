@@ -11,7 +11,11 @@ from . import logic
 
 _TEMPLATE = "plotly_dark"
 SLOTS_PER_FRAME = 2250
-GRID_COLS, GRID_ROWS = 75, 30      # 75×30 = 2250 (채널당 한 장)
+GRID_COLS, GRID_ROWS = 75, 30      # 75×30 = 2250
+
+# A/B 통합 슬롯맵 색: 채널 A=파랑, 채널 B=청록, 위반=빨강
+_CH_COLOR = {"A": "#4D9FEC", "B": "#33C4B3"}
+_VIOL_COLOR = "#F2453C"
 
 _PIE_COLORS = {"정상": "#3BA776", "보고주기 위반": "#E8A33D",
                "슬롯 위반": "#D64550", "둘 다 위반": "#8E44AD"}
@@ -95,6 +99,76 @@ def channel_slot_map(channel_df, channel: str):
                    font=dict(size=13), x=0.01, y=0.99),
         plot_bgcolor="#0E1117",
     )
+    return fig
+
+
+def combined_slot_map(frame_df, highlight_mmsi=None):
+    """채널 A/B 를 한 그리드(75×30)에 통합한 슬롯맵. 클릭 선택 지원(scattergl).
+
+    - 채널 A = 파랑, 채널 B = 청록, 위반 = 빨강 (채널 무관)
+    - A 마커는 셀 왼쪽(x-0.2), B 마커는 오른쪽(x+0.2)에 찍어 한 슬롯에 두 채널이
+      같이 와도 겹치지 않게 구분
+    - highlight_mmsi 지정 시 그 선박의 슬롯을 크게+흰 테두리로 강조
+    - customdata=[mmsi, ...] 로 클릭 시 MMSI 를 회수
+    frame_df columns=[vsi_slot, mmsi, msg_type, channel, is_violation,
+                      ri_reason, slot_reason, ri_missed_count, vsi_rssi, vsi_snr, dist_km]
+    """
+    fig = go.Figure()
+
+    def _add(sub, color, name, offset):
+        if sub.empty:
+            return
+        slot = sub["vsi_slot"].astype(int).values
+        x = (slot % GRID_COLS) + offset
+        y = slot // GRID_COLS
+        texts = []
+        for r in sub.itertuples(index=False):
+            reason = logic.combined_reason_ko(r.ri_reason, r.slot_reason,
+                                              getattr(r, "ri_missed_count", 0))
+            rssi = "-" if pd.isna(r.vsi_rssi) else f"{r.vsi_rssi:.0f}"
+            snr = "-" if pd.isna(r.vsi_snr) else f"{r.vsi_snr:.0f}"
+            dist = "-" if pd.isna(r.dist_km) else f"{r.dist_km:.2f}km"
+            texts.append(f"슬롯 {int(r.vsi_slot)} · 채널 {r.channel} · MMSI {r.mmsi} "
+                         f"· Type{r.msg_type}<br>사유: {reason}<br>"
+                         f"RSSI {rssi} · SNR {snr} · 거리 {dist}")
+        fig.add_trace(go.Scattergl(
+            x=x, y=y, mode="markers", name=name,
+            marker=dict(color=color, size=6, symbol="square",
+                        line=dict(width=0)),
+            customdata=sub["mmsi"].values, text=texts,
+            hovertemplate="%{text}<extra></extra>"))
+
+    viol = frame_df[frame_df["is_violation"]]
+    ok_a = frame_df[~frame_df["is_violation"] & (frame_df["channel"] == "A")]
+    ok_b = frame_df[~frame_df["is_violation"] & (frame_df["channel"] == "B")]
+    _add(ok_a, _CH_COLOR["A"], "채널 A (정상)", -0.2)
+    _add(ok_b, _CH_COLOR["B"], "채널 B (정상)", +0.2)
+    # 위반은 채널별 위치는 유지하되 색만 빨강
+    va = viol[viol["channel"] == "A"]; vb = viol[viol["channel"] == "B"]
+    _add(va, _VIOL_COLOR, "위반", -0.2)
+    _add(vb, _VIOL_COLOR, "위반", +0.2)
+
+    if highlight_mmsi is not None:
+        hs = frame_df[frame_df["mmsi"] == highlight_mmsi]
+        if not hs.empty:
+            slot = hs["vsi_slot"].astype(int).values
+            offs = np.where(hs["channel"].values == "A", -0.2, 0.2)
+            fig.add_trace(go.Scattergl(
+                x=(slot % GRID_COLS) + offs, y=slot // GRID_COLS,
+                mode="markers", name=f"선택: {highlight_mmsi}",
+                marker=dict(color="rgba(0,0,0,0)", size=13, symbol="square",
+                            line=dict(width=2, color="#FFFFFF")),
+                hoverinfo="skip", showlegend=True))
+
+    fig.update_yaxes(autorange="reversed", showticklabels=False, showgrid=False,
+                     range=[-0.5, GRID_ROWS - 0.5], scaleanchor="x", scaleratio=1)
+    fig.update_xaxes(showticklabels=False, showgrid=False, range=[-0.7, GRID_COLS - 0.3])
+    fig.update_layout(
+        template=_TEMPLATE, height=480, margin=dict(t=28, b=6, l=6, r=6),
+        plot_bgcolor="#0E1117", clickmode="event+select",
+        legend=dict(orientation="h", y=1.04),
+        title=dict(text="슬롯 0(좌상) → 2249(우하) · 셀 왼쪽=채널A, 오른쪽=채널B · 슬롯 클릭 시 그 선박 강조",
+                   font=dict(size=12), x=0.01, y=0.99))
     return fig
 
 

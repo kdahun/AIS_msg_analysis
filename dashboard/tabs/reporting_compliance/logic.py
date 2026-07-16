@@ -26,7 +26,8 @@ SLOTS_PER_FRAME = 2250
 
 # 사유 코드 → 한글 (여러 곳(표/차트 hover)에서 공유)
 REASON_LABELS_KO = {
-    "RI_TOO_SLOW": "보고 지연(기대보다 늦음)",
+    "RI_MISSED": "보고 누락(격자 위지만 중간에 빠짐)",
+    "RI_INTERVAL_BAD": "보고주기 부적합(간격이 규정 정수배와 안 맞음)",
     "RI_TOO_FAST": "과도한 보고(기대보다 빠름)",
     "SLOT_REPEAT_MISSING": "슬롯 반복 누락(1프레임 뒤 같은 슬롯 없음)",
     "SLOT_SWITCH_MISSING": "슬롯 교체 예고 불일치(예고슬롯 미등장)",
@@ -35,15 +36,21 @@ REASON_LABELS_KO = {
 }
 
 
-def reason_ko(code: str) -> str:
-    """빈 문자열/None 은 '정상'으로."""
+def reason_ko(code: str, missed_count: int = 0) -> str:
+    """빈 문자열/None 은 '정상'으로. RI_MISSED 는 누락 개수를 붙인다."""
     if not code:
         return "정상"
+    if code == "RI_MISSED" and missed_count:
+        return f"보고 누락 {missed_count}개"
     return REASON_LABELS_KO.get(code, code)
 
 
-def combined_reason_ko(ri_reason: str, slot_reason: str) -> str:
-    parts = [reason_ko(r) for r in (ri_reason, slot_reason) if r]
+def combined_reason_ko(ri_reason: str, slot_reason: str, missed_count: int = 0) -> str:
+    parts = []
+    if ri_reason:
+        parts.append(reason_ko(ri_reason, missed_count))
+    if slot_reason:
+        parts.append(reason_ko(slot_reason))
     return " / ".join(parts) if parts else "정상"
 FRAME_SEC = 60.0
 TMO_MIN, TMO_MAX = 3, 7
@@ -175,19 +182,38 @@ def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── classify (싸다, 슬라이더 임계값 적용) ────────────────────
-def classify(df: pd.DataFrame, slow_factor=2.0, fast_factor=0.5,
+def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.0,
              time_tol_sec=5.0) -> pd.DataFrame:
     """enrich 된 df 에 사용자 임계값을 적용해 사유 컬럼 생성(벡터화, 즉시).
-    추가/갱신: ri_reason, slot_reason, is_violation
+    추가/갱신: ri_reason, ri_missed_count, slot_reason, is_violation
+
+    보고주기 판정(중앙값 미사용): 메시지마다 비율 = 실제간격/기대간격.
+      - 비율 < fast_factor            → 과도한 보고
+      - |비율 − round(비율)| ≤ grid_tol (규정 간격의 정수배 = '격자 위'):
+            round(비율) ≥ 2 → 보고 누락 (round-1 개)
+            아니면          → 정상
+      - 정수배에서 벗어남              → 보고주기 부적합
+    grid_tol 은 기본 0 (엄격) 이며 사용자가 슬라이더로 올려 완화한다.
     """
     df = df.copy()
     exp = df["expected_interval"].values
     act = df["actual_gap"].values
     ri = np.full(len(df), "", dtype=object)
-    with np.errstate(invalid="ignore"):
-        ri[act > exp * slow_factor] = "RI_TOO_SLOW"
-        ri[(act < exp * fast_factor) & (ri == "")] = "RI_TOO_FAST"
-    ri[np.isnan(act)] = ""
+    missed = np.zeros(len(df), dtype=int)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = act / exp
+        k = np.round(ratio)
+        dev = np.abs(ratio - k)
+        valid = ~np.isnan(act)
+        too_fast = valid & (ratio < fast_factor)
+        on_grid = valid & ~too_fast & (dev <= grid_tol)
+        off_grid = valid & ~too_fast & (dev > grid_tol)
+        missed_case = on_grid & (k >= 2)
+        ri[too_fast] = "RI_TOO_FAST"
+        ri[off_grid] = "RI_INTERVAL_BAD"
+        ri[missed_case] = "RI_MISSED"
+        missed[missed_case] = (k[missed_case] - 1).astype(int)
+    df["ri_missed_count"] = missed
 
     kind = df["chain_kind"].values
     ge = df["chain_gap_err"].values

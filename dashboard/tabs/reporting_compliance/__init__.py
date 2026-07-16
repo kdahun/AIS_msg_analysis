@@ -26,19 +26,22 @@ def render():
 
     with st.expander("판정 임계값 조절", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
-        slow = c1.slider("보고 지연 배율 (기대×N 초과 시 위반)", 1.2, 5.0, 2.0, 0.1,
-                         key="rc_slow", help="예: 기대 10초, 배율 2.0 → 20초 초과 시 '보고 지연'")
+        grid_tol = c1.slider("보고주기 격자 허용오차", 0.0, 0.5, 0.2, 0.02, key="rc_grid",
+                             help="실제간격/기대간격 비율이 정수배(격자)에서 이 값 이내면 "
+                                  "'격자 위'로 봄. 0=엄격(정확한 정수배만 정상 → 지터까지 위반). "
+                                  "슬라이더를 0까지 내릴 수 있음. 올릴수록 '보고주기 부적합'이 "
+                                  "'보고 누락/정상'으로 완화됨")
         fast = c2.slider("과도 보고 배율 (기대×N 미만 시 위반)", 0.1, 0.9, 0.5, 0.05,
                          key="rc_fast", help="예: 기대 10초, 배율 0.5 → 5초 미만 시 '과도한 보고'")
-        tol = c3.slider("슬롯 시간 허용오차 (초)", 0.1, 10.0, 5.0, 0.1, key="rc_tol",
-                        help="다음 프레임(60초 뒤) 예고/반복 슬롯을 찾을 때 허용할 시간 오차")
+        tol = c3.slider("슬롯 시간 허용오차 (초)", 0.0, 10.0, 0.0, 0.1, key="rc_tol",
+                        help="다음 프레임(60초 뒤) 예고/반복 슬롯을 찾을 때 허용할 시간 오차 (기본 0=엄격)")
         margin = c4.slider("수신한계 여유 (dB)", 3.0, 20.0, 10.0, 1.0, key="rc_margin",
                            help="선박 RSSI가 잡음층+이 값 미만이면 '수신한계 근접'으로 판정. "
                                 "AIS 복조에 통상 ~10dB SNR 이 필요")
 
     enriched = data.get_enriched()
     noise_df = data.get_noise_floor()
-    df = logic.classify(enriched, slow_factor=slow, fast_factor=fast, time_tol_sec=tol)
+    df = logic.classify(enriched, fast_factor=fast, grid_tol=grid_tol, time_tol_sec=tol)
 
     # ── MMSI 필터 (화면 전체에 적용) ─────────────────────────
     mmsi_opts = sorted(df["mmsi"].unique().tolist())
@@ -118,26 +121,54 @@ def _render_slot_map(df, noise_df, margin):
 
     occ = len(fdf)
     viol = int(fdf["is_violation"].sum())
-    st.caption(f"**{sel_ts:%Y-%m-%d %H:%M}** · 수신 {occ:,}건 · 위반 {viol}건 · "
-              "파랑=정상 수신, 주황=위반, 어두움=빈슬롯 (마우스 올리면 슬롯번호·상세정보)")
+    n_a = int((fdf["channel"] == "A").sum())
+    n_b = int((fdf["channel"] == "B").sum())
+    st.caption(f"**{sel_ts:%Y-%m-%d %H:%M}** · 수신 {occ:,}건(A {n_a}·B {n_b}) · 위반 {viol}건 · "
+              "파랑=채널A, 청록=채널B, 빨강=위반 · 슬롯을 클릭하면 그 선박이 강조되고 아래 표가 필터됩니다")
 
-    # 채널 A/B 각각 2,250슬롯 그리드 (SOTDMA 프레임은 채널별로 독립)
-    for ch in ("A", "B"):
-        cdf = fdf[fdf["channel"] == ch]
-        c_occ, c_viol = len(cdf), int(cdf["is_violation"].sum())
-        st.markdown(f"##### 채널 {ch} — 점유 {c_occ:,} / 2,250 · 위반 {c_viol}건")
-        st.plotly_chart(charts.channel_slot_map(cdf, ch),
-                        use_container_width=True, key=f"rc_slotmap_{ch}")
+    # 선박 강조/필터: selectbox(확실) + 슬롯 클릭(보조) — 둘 다 같은 선택값을 씀
+    vessels = sorted(fdf["mmsi"].unique().tolist())
+    # 슬롯 클릭으로 대기중인 선택을 selectbox 값으로 반영
+    if "rc_pending_sel" in st.session_state:
+        st.session_state["rc_sel_box"] = st.session_state.pop("rc_pending_sel")
+    # 프레임이 바뀌어 이전 선택이 이 프레임에 없으면 초기화(selectbox 오류 방지)
+    if st.session_state.get("rc_sel_box") not in ([None] + vessels):
+        st.session_state["rc_sel_box"] = None
+    sel_mmsi = st.selectbox(
+        "강조·필터할 선박 (슬롯을 클릭해도 선택됨)", [None] + vessels,
+        format_func=lambda m: "(선택 안 함)" if m is None else f"MMSI {m}",
+        key="rc_sel_box")
 
-    viol_rows = fdf[fdf["is_violation"]]
-    if len(viol_rows):
-        noise_map = noise_df.set_index("frame")["noise_dbm"]
-        show = viol_rows.copy()
-        show["사유"] = [logic.combined_reason_ko(r, s)
-                       for r, s in zip(show["ri_reason"], show["slot_reason"])]
+    fig = charts.combined_slot_map(fdf, highlight_mmsi=sel_mmsi)
+    event = st.plotly_chart(fig, use_container_width=True,
+                            key=f"rc_map_{st.session_state.rc_frame_idx}",
+                            on_select="rerun", selection_mode="points")
+    try:
+        pts = (event.get("selection") or {}).get("points", []) if event else []
+    except AttributeError:
+        pts = []
+    if pts:
+        cd = pts[0].get("customdata")
+        clicked = cd[0] if isinstance(cd, (list, tuple)) else cd
+        if clicked is not None and int(clicked) != (sel_mmsi if sel_mmsi is not None else -1):
+            st.session_state["rc_pending_sel"] = int(clicked)
+            st.rerun()
+
+    # ── 표: 선박 선택 시 그 선박 전체 / 아니면 전체 위반 ──────
+    noise_map = noise_df.set_index("frame")["noise_dbm"]
+    if sel_mmsi is not None:
+        rows = fdf[fdf["mmsi"] == sel_mmsi]
+        table_title = f"선택 선박 MMSI {sel_mmsi} 의 이 프레임 메시지 ({len(rows)}건)"
+    else:
+        rows = fdf[fdf["is_violation"]]
+        table_title = None
+
+    if len(rows):
+        show = rows.copy()
+        show["사유"] = [logic.combined_reason_ko(r, s, m)
+                       for r, s, m in zip(show["ri_reason"], show["slot_reason"],
+                                          show["ri_missed_count"])]
         show["변침"] = show["changing_course"].map({True: "예", False: "아니오"})
-        # 잡음여유 = 이 메시지의 RSSI − 그 시점 잡음층. margin 미만이면 수신한계 근접
-        # (이후 메시지가 잡음에 묻혀 유실됐을 가능성 = 환경 요인으로 설명 가능한 위반)
         show["잡음여유(dB)"] = show["vsi_rssi"] - show["frame"].map(noise_map)
         show["환경요인?"] = show["잡음여유(dB)"].lt(margin).map(
             {True: "예(수신한계 근접)", False: ""})
@@ -150,12 +181,17 @@ def _render_slot_map(df, noise_df, margin):
             "vsi_rssi": "RSSI", "vsi_snr": "SNR", "dist_km": "거리(km)",
         })
         show = show.sort_values(["채널", "슬롯"]).round({"거리(km)": 2, "잡음여유(dB)": 0})
-        env_n = int((show["환경요인?"] != "").sum())
-        st.caption(f"이 프레임의 위반 내역 ({len(show)}건, 그중 수신한계 근접 {env_n}건) — "
-                  f"잡음여유(RSSI−잡음층)가 {margin:.0f}dB 미만이면 신호가 잡음에 묻혀 "
-                  "수신 유실됐을 가능성이 높은 환경성 위반입니다 "
-                  "(거리는 전 구간 한국해양대 좌표 기준, 모텔 구간은 근사값)")
+        if table_title:
+            st.caption(table_title + " — 슬롯맵 클릭으로 선택됨. '선택 해제'로 전체 위반 보기")
+        else:
+            env_n = int((show["환경요인?"] != "").sum())
+            st.caption(f"이 프레임의 위반 내역 ({len(show)}건, 그중 수신한계 근접 {env_n}건) — "
+                      f"잡음여유(RSSI−잡음층)가 {margin:.0f}dB 미만이면 신호가 잡음에 묻혀 "
+                      "수신 유실됐을 가능성이 높은 환경성 위반입니다 "
+                      "(거리는 전 구간 한국해양대 좌표 기준, 모텔 구간은 근사값)")
         st.dataframe(show, use_container_width=True, hide_index=True)
+    elif sel_mmsi is not None:
+        st.info(f"MMSI {sel_mmsi} 는 이 프레임에 메시지가 없습니다.")
 
     _render_context_lines(df, sel_ts, fdf, noise_df, margin)
 
