@@ -25,15 +25,32 @@ COURSE_AVG_WINDOW = "30s"
 SLOTS_PER_FRAME = 2250
 
 # 사유 코드 → 한글 (여러 곳(표/차트 hover)에서 공유)
+# 위반 사유: 원그래프·MMSI 표에서 '위반'으로 집계된다.
 REASON_LABELS_KO = {
     "RI_MISSED": "보고 누락(격자 위지만 중간에 빠짐)",
     "RI_INTERVAL_BAD": "보고주기 부적합(간격이 규정 정수배와 안 맞음)",
     "RI_TOO_FAST": "과도한 보고(기대보다 빠름)",
-    "SLOT_REPEAT_MISSING": "슬롯 반복 누락(1프레임 뒤 같은 슬롯 없음)",
-    "SLOT_SWITCH_MISSING": "슬롯 교체 예고 불일치(예고슬롯 미등장)",
+    "SLOT_NUM_MISMATCH": "슬롯번호 불일치(보고 슬롯 ≠ 관측 슬롯)",
+    "SLOT_REPEAT_MISSING": "슬롯 반복 누락(다음 프레임에 그 슬롯 미점유)",
+    "SLOT_SWITCH_MISSING": "슬롯 교체 예고 불일치(예고 슬롯 미점유)",
     "TIMEOUT_NOT_DECREMENTED": "timeout 미감소(1씩 안 줄어듦)",
     "TIMEOUT_REINIT_OUT_OF_RANGE": "timeout 재초기화 범위밖([3,7] 벗어남)",
 }
+
+# 검증 보류(위반 아님): 다음 프레임에 그 선박이 수신되지 않아 슬롯 체인을
+# 확인할 수 없는 경우. 그 시점 잡음층 대비 신호여유로 환경성/미상을 구분한다.
+HOLD_LABELS_KO = {
+    "SLOT_UNVERIF_NOISE": "검증보류(수신한계 근접 — 환경성 유실 추정)",
+    "SLOT_UNVERIF_PENDING": "검증보류(다음 프레임 미수신 — 원인 미상)",
+}
+
+# 슬롯 사유 중 '진짜 위반'으로 집계할 코드(보류 코드는 is_violation 에서 제외)
+SLOT_VIOLATION_CODES = frozenset({
+    "SLOT_NUM_MISMATCH", "SLOT_REPEAT_MISSING", "TIMEOUT_NOT_DECREMENTED",
+    "SLOT_SWITCH_MISSING", "TIMEOUT_REINIT_OUT_OF_RANGE"})
+SLOT_HOLD_CODES = frozenset(HOLD_LABELS_KO)
+
+_ALL_LABELS = {**REASON_LABELS_KO, **HOLD_LABELS_KO}
 
 
 def reason_ko(code: str, missed_count: int = 0) -> str:
@@ -42,7 +59,7 @@ def reason_ko(code: str, missed_count: int = 0) -> str:
         return "정상"
     if code == "RI_MISSED" and missed_count:
         return f"보고 누락 {missed_count}개"
-    return REASON_LABELS_KO.get(code, code)
+    return _ALL_LABELS.get(code, code)
 
 
 def combined_reason_ko(ri_reason: str, slot_reason: str, missed_count: int = 0) -> str:
@@ -117,61 +134,96 @@ def enrich_vessel(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _enrich_slot_chain(df: pd.DataFrame):
-    """Type 1 슬롯 체인의 오차무관 지표를 채운다(제자리 수정)."""
+    """Type 1 슬롯 체인을 '프레임 인덱스 + 슬롯번호' 이산 검증으로 채운다(제자리 수정).
+
+    수신시각 60초 근접이 아니라 frame(=UTC분) 단위로 '다음 프레임'을 찾으므로
+    서브초 지터에 영향받지 않는다 → 슬롯 검증에 허용오차가 필요 없다.
+
+    검증 근거(ITU-R M.1371 SOTDMA 통신상태 sub message):
+      timeout ∈ {2,4,6} → sub_message = 사용 슬롯 번호      → vsi_slot 과 일치해야
+      timeout == 0       → sub_message = 다음 프레임 슬롯 offset → (slot+offset)%2250 점유
+      timeout  > 0       → 같은 슬롯을 다음 프레임에도 유지(timeout 1 감소)
+      timeout ∈ {1,3,5,7}→ sub_message 가 슬롯이 아님(UTC/수신국수) → 번호검사 제외
+
+    추가 컬럼:
+      chain_kind             : 'repeat'(to>0) | 'switch'(to==0) | ''
+      slot_num_bad           : to∈{2,4,6} 인데 sub_message≠vsi_slot (bool)
+      chain_heard_next       : 다음 프레임에 이 선박이 (그 채널에서) 수신됐나
+      chain_slot_matched     : 기대 슬롯이 다음 프레임에 실제 점유됐나
+      chain_next_timeout     : 그 기대 슬롯의 다음 프레임 slot_timeout (없으면 nan)
+      chain_expected_timeout : repeat=to-1, switch=nan
+    """
     n = len(df)
     kind = np.full(n, "", dtype=object)
-    gap_err = np.full(n, np.nan)           # 관련 슬롯의 '1프레임 뒤' 등장까지 오차(초)
-    next_to = np.full(n, np.nan)           # 그 등장 시점의 slot_timeout
-    exp_to = np.full(n, np.nan)            # 기대 timeout (repeat 케이스만; switch 는 [3,7])
+    num_bad = np.zeros(n, dtype=bool)
+    heard_next = np.zeros(n, dtype=bool)
+    slot_matched = np.zeros(n, dtype=bool)
+    next_to = np.full(n, np.nan)
+    exp_to = np.full(n, np.nan)
 
     t1_mask = df["msg_type"].values == 1
     if not t1_mask.any():
-        df["chain_kind"] = kind; df["chain_gap_err"] = gap_err
+        df["chain_kind"] = kind; df["slot_num_bad"] = num_bad
+        df["chain_heard_next"] = heard_next; df["chain_slot_matched"] = slot_matched
         df["chain_next_timeout"] = next_to; df["chain_expected_timeout"] = exp_to
         return
 
     # SOTDMA 통신상태는 "해당 채널의 그 슬롯"에만 적용된다(M.1371-6 A2-3.3.7.2.2).
-    # 따라서 슬롯 체인 추적은 (채널, 슬롯) 단위로 한다. channel 컬럼이 없으면 슬롯만으로.
     has_ch = "channel" in df.columns
-    t1 = df[t1_mask]
-    if has_ch:
-        slot_times = {k: g["vsi_time"].values for k, g in t1.groupby(["channel", "vsi_slot"])}
-        slot_tos = {k: g["slot_timeout"].values for k, g in t1.groupby(["channel", "vsi_slot"])}
-    else:
-        slot_times = {(s,): g["vsi_time"].values for s, g in t1.groupby("vsi_slot")}
-        slot_tos = {(s,): g["slot_timeout"].values for s, g in t1.groupby("vsi_slot")}
+    ch_all = df["channel"].values if has_ch else np.full(n, "-", dtype=object)
+    frame = df["frame"].values                          # datetime64[ns] (분 바닥)
+    one_min = np.timedelta64(60, "s")
 
-    def nearest_next_frame(key, t):
-        arr = slot_times.get(key)
-        if arr is None:
-            return np.nan, np.nan
-        target = t + np.timedelta64(int(FRAME_SEC * 1000), "ms")
-        diffs = np.abs((arr - target) / np.timedelta64(1, "s"))
-        j = int(np.argmin(diffs))
-        return float(diffs[j]), float(slot_tos[key][j])
-
-    ch_vals = df["channel"].values if has_ch else None
+    # (채널, 프레임) → 그 선박이 수신됐는지 (Type1/3 모두 = 물리적 수신 여부)
+    present = set()
+    for i in range(n):
+        present.add((ch_all[i], frame[i]))
+    # (채널, 프레임) → {슬롯: timeout}  (Type1 만; 슬롯 점유 확인용)
+    t1_slots: dict = {}
     for i in np.where(t1_mask)[0]:
-        to = df["slot_timeout"].values[i]
+        t1_slots.setdefault((ch_all[i], frame[i]), {})[int(df["vsi_slot"].values[i])] = \
+            df["slot_timeout"].values[i]
+
+    slot_vals = df["vsi_slot"].values
+    to_vals = df["slot_timeout"].values
+    sub_vals = df["sub_message"].values
+    for i in np.where(t1_mask)[0]:
+        to = to_vals[i]
         if to is None or pd.isna(to):
             continue
         to = int(to)
-        slot = int(df["vsi_slot"].values[i])
-        t = np.datetime64(df["vsi_time"].values[i])
-        mk = (lambda s: (ch_vals[i], s)) if has_ch else (lambda s: (s,))
-        if to > 0:
-            ge, nt = nearest_next_frame(mk(slot), t)
-            kind[i] = "repeat"; gap_err[i] = ge; next_to[i] = nt; exp_to[i] = to - 1
-        else:
-            sub = df["sub_message"].values[i]
+        slot = int(slot_vals[i])
+        sub = sub_vals[i]
+        ch = ch_all[i]
+        f_next = frame[i] + one_min
+
+        # timeout ∈ {2,4,6}: 보고한 슬롯 번호(sub_message)와 관측 슬롯(vsi_slot) 일치검사
+        if to in (2, 4, 6) and sub is not None and not pd.isna(sub):
+            num_bad[i] = int(sub) != slot
+
+        heard_next[i] = (ch, f_next) in present
+        nxt = t1_slots.get((ch, f_next), {})
+
+        if to > 0:                                       # repeat: 같은 슬롯 유지
+            kind[i] = "repeat"; exp_to[i] = to - 1
+            if slot in nxt:
+                slot_matched[i] = True
+                nto = nxt[slot]
+                next_to[i] = float(nto) if nto is not None and not pd.isna(nto) else np.nan
+        else:                                            # switch: offset 예고 슬롯 점유
             if sub is None or pd.isna(sub):
                 continue
+            kind[i] = "switch"
             pred = (slot + int(sub)) % SLOTS_PER_FRAME
-            ge, nt = nearest_next_frame(mk(pred), t)
-            kind[i] = "switch"; gap_err[i] = ge; next_to[i] = nt
+            if pred in nxt:
+                slot_matched[i] = True
+                nto = nxt[pred]
+                next_to[i] = float(nto) if nto is not None and not pd.isna(nto) else np.nan
 
     df["chain_kind"] = kind
-    df["chain_gap_err"] = gap_err
+    df["slot_num_bad"] = num_bad
+    df["chain_heard_next"] = heard_next
+    df["chain_slot_matched"] = slot_matched
     df["chain_next_timeout"] = next_to
     df["chain_expected_timeout"] = exp_to
 
@@ -182,20 +234,44 @@ def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── classify (싸다, 슬라이더 임계값 적용) ────────────────────
-def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.0,
-             time_tol_sec=5.0) -> pd.DataFrame:
+def _signal_margin_next_frame(df: pd.DataFrame, noise_df) -> np.ndarray:
+    """각 행의 (RSSI − 다음 프레임 잡음층)[dB]. 잡음층이 없으면 nan.
+
+    다음 프레임에 그 선박이 수신되지 않았을 때, 그 시점 주변 잡음층(다른 선박들의
+    RSSI−SNR 중앙값) 대비 이 선박의 직전 RSSI 가 얼마나 여유가 있었는지를 본다.
+    여유가 작으면 신호가 잡음에 묻혀 못 받은 '환경성 유실'로 볼 근거가 된다.
+    """
+    n = len(df)
+    if noise_df is None or not len(noise_df):
+        return np.full(n, np.nan)
+    noise_by_frame = noise_df.set_index("frame")["noise_dbm"]
+    next_frame = df["frame"] + pd.Timedelta(minutes=1)
+    noise_next = next_frame.map(noise_by_frame).values
+    return df["vsi_rssi"].values - noise_next
+
+
+def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
+             noise_df=None, decode_margin=10.0) -> pd.DataFrame:
     """enrich 된 df 에 사용자 임계값을 적용해 사유 컬럼 생성(벡터화, 즉시).
     추가/갱신: ri_reason, ri_missed_count, slot_reason, is_violation
 
-    보고주기 판정(중앙값 미사용): 메시지마다 비율 = 실제간격/기대간격.
+    보고주기(시간 비율 → grid_tol/fast_factor 필요), 메시지마다 비율 = 실제간격/기대간격:
       - 비율 < fast_factor            → 과도한 보고
       - |비율 − round(비율)| ≤ grid_tol (규정 간격의 정수배 = '격자 위'):
-            round(비율) ≥ 2 → 보고 누락 (round-1 개)
-            아니면          → 정상
+            round(비율) ≥ 2 → 보고 누락 (round-1 개)  /  아니면 정상
       - 정수배에서 벗어남              → 보고주기 부적합
-    grid_tol 은 기본 0 (엄격) 이며 사용자가 슬라이더로 올려 완화한다.
+
+    슬롯 체인(이산 검증 → 허용오차 없음, enrich 에서 산출한 지표를 그대로 적용):
+      - to∈{2,4,6} sub_message≠vsi_slot → 슬롯번호 불일치
+      - 다음 프레임에 수신됨(heard):
+          repeat: 그 슬롯 미점유→반복누락 / 점유했으나 timeout≠to-1→미감소
+          switch: 예고슬롯 미점유→예고불일치 / 점유했으나 timeout∉[3,7]→재초기화범위밖
+      - 다음 프레임 미수신(¬heard) → 위반이 아니라 '검증 보류':
+          (RSSI − 다음프레임 잡음층) < decode_margin → 환경성 유실 추정
+          그 외/알수없음                              → 원인 미상
     """
     df = df.copy()
+    # ── 보고주기 ──
     exp = df["expected_interval"].values
     act = df["actual_gap"].values
     ri = np.full(len(df), "", dtype=object)
@@ -215,22 +291,38 @@ def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.0,
         missed[missed_case] = (k[missed_case] - 1).astype(int)
     df["ri_missed_count"] = missed
 
+    # ── 슬롯 체인 (이산, 허용오차 없음) ──
     kind = df["chain_kind"].values
-    ge = df["chain_gap_err"].values
+    heard = df["chain_heard_next"].values.astype(bool)
+    matched = df["chain_slot_matched"].values.astype(bool)
     nt = df["chain_next_timeout"].values
     et = df["chain_expected_timeout"].values
+    num_bad = df["slot_num_bad"].values.astype(bool)
     slot = np.full(len(df), "", dtype=object)
 
+    rep = kind == "repeat"
+    sw = kind == "switch"
     with np.errstate(invalid="ignore"):
-        found = ge <= time_tol_sec       # 1프레임 뒤 해당 슬롯이 있었는가
-        rep = kind == "repeat"
-        sw = kind == "switch"
-        slot[rep & ~found] = "SLOT_REPEAT_MISSING"
-        slot[rep & found & (nt != et)] = "TIMEOUT_NOT_DECREMENTED"
-        slot[sw & ~found] = "SLOT_SWITCH_MISSING"
-        slot[sw & found & ~((nt >= TMO_MIN) & (nt <= TMO_MAX))] = "TIMEOUT_REINIT_OUT_OF_RANGE"
+        # 다음 프레임에서 수신됨 → 슬롯 체인 실제 위반 판정
+        slot[rep & heard & ~matched] = "SLOT_REPEAT_MISSING"
+        slot[rep & heard & matched & (nt != et)] = "TIMEOUT_NOT_DECREMENTED"
+        slot[sw & heard & ~matched] = "SLOT_SWITCH_MISSING"
+        slot[sw & heard & matched & ~((nt >= TMO_MIN) & (nt <= TMO_MAX))] = \
+            "TIMEOUT_REINIT_OUT_OF_RANGE"
+
+        # 다음 프레임 미수신 → 검증 보류(위반 아님): 잡음층으로 환경성/미상 구분
+        unheard = (rep | sw) & ~heard
+        if unheard.any():
+            margin = _signal_margin_next_frame(df, noise_df)
+            env = unheard & (margin < decode_margin)     # margin nan → False → pending
+            slot[unheard & ~env] = "SLOT_UNVERIF_PENDING"
+            slot[env] = "SLOT_UNVERIF_NOISE"
+
+    # 슬롯번호 불일치(2/4/6)는 가장 근본적 → 최우선 표기
+    slot[num_bad] = "SLOT_NUM_MISMATCH"
 
     df["ri_reason"] = ri
     df["slot_reason"] = slot
-    df["is_violation"] = (ri != "") | (slot != "")
+    slot_is_viol = np.array([s in SLOT_VIOLATION_CODES for s in slot])
+    df["is_violation"] = (ri != "") | slot_is_viol
     return df

@@ -18,7 +18,8 @@ _CH_COLOR = {"A": "#4D9FEC", "B": "#33C4B3"}
 _VIOL_COLOR = "#F2453C"
 
 _PIE_COLORS = {"정상": "#3BA776", "보고주기 위반": "#E8A33D",
-               "슬롯 위반": "#D64550", "둘 다 위반": "#8E44AD"}
+               "슬롯 위반": "#D64550", "둘 다 위반": "#8E44AD", "검증 보류": "#7A8290"}
+_HOLD_COLOR = "#7A8290"
 
 # 0=빈슬롯(어두움+은은한 격자), 1=정상(파랑), 2=위반(주황) — 참조 이미지 팔레트
 _COLORSCALE = [[0.0, "#161B26"], [0.33, "#161B26"],
@@ -27,18 +28,26 @@ _COLORSCALE = [[0.0, "#161B26"], [0.33, "#161B26"],
 
 
 def category_series(df):
-    """메시지별 위반 카테고리 Series 반환 (정상/보고주기/슬롯/둘다)."""
+    """메시지별 카테고리 Series (정상/보고주기 위반/슬롯 위반/둘 다 위반/검증 보류).
+
+    '검증 보류'는 위반이 아니라 다음 프레임 미수신으로 슬롯 체인을 확인 못한 경우.
+    보고주기 위반이 함께 있으면 그건 확정 위반이므로 위반 쪽으로 분류한다.
+    """
     ri = df["ri_reason"].values != ""
-    slot = df["slot_reason"].values != ""
-    cat = np.where(ri & slot, "둘 다 위반",
+    slot_code = df["slot_reason"].values.astype(str)
+    slot_viol = np.array([s in logic.SLOT_VIOLATION_CODES for s in slot_code])
+    slot_hold = np.array([s in logic.SLOT_HOLD_CODES for s in slot_code])
+    cat = np.where(ri & slot_viol, "둘 다 위반",
           np.where(ri, "보고주기 위반",
-          np.where(slot, "슬롯 위반", "정상")))
+          np.where(slot_viol, "슬롯 위반",
+          np.where(slot_hold, "검증 보류", "정상"))))
     return pd.Series(cat, index=df.index)
 
 
 def compliance_pie(cat_counts: dict):
     """정상/위반 카테고리 원그래프. cat_counts = {카테고리: 건수}."""
-    labels = [k for k in ["정상", "보고주기 위반", "슬롯 위반", "둘 다 위반"] if cat_counts.get(k, 0) > 0]
+    labels = [k for k in ["정상", "보고주기 위반", "슬롯 위반", "둘 다 위반", "검증 보류"]
+              if cat_counts.get(k, 0) > 0]
     values = [cat_counts[k] for k in labels]
     fig = go.Figure(go.Pie(
         labels=labels, values=values, hole=0.45,
@@ -138,11 +147,15 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
             customdata=sub["mmsi"].values, text=texts,
             hovertemplate="%{text}<extra></extra>"))
 
+    hold = frame_df["slot_reason"].isin(list(logic.SLOT_HOLD_CODES)) & ~frame_df["is_violation"]
     viol = frame_df[frame_df["is_violation"]]
-    ok_a = frame_df[~frame_df["is_violation"] & (frame_df["channel"] == "A")]
-    ok_b = frame_df[~frame_df["is_violation"] & (frame_df["channel"] == "B")]
-    _add(ok_a, _CH_COLOR["A"], "채널 A (정상)", -0.2)
-    _add(ok_b, _CH_COLOR["B"], "채널 B (정상)", +0.2)
+    held = frame_df[hold]
+    ok = frame_df[~frame_df["is_violation"] & ~hold]
+    _add(ok[ok["channel"] == "A"], _CH_COLOR["A"], "채널 A (정상)", -0.2)
+    _add(ok[ok["channel"] == "B"], _CH_COLOR["B"], "채널 B (정상)", +0.2)
+    # 검증 보류(다음 프레임 미수신)는 회색
+    _add(held[held["channel"] == "A"], _HOLD_COLOR, "검증 보류", -0.2)
+    _add(held[held["channel"] == "B"], _HOLD_COLOR, "검증 보류", +0.2)
     # 위반은 채널별 위치는 유지하되 색만 빨강
     va = viol[viol["channel"] == "A"]; vb = viol[viol["channel"] == "B"]
     _add(va, _VIOL_COLOR, "위반", -0.2)

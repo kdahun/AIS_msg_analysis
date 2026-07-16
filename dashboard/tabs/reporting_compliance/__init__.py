@@ -20,12 +20,15 @@ def render():
     st.caption(
         "① SOG·항해상태·**변침여부(HDG 30초 평균 대비 현재 HDG, 5도 초과 시 변침)**로 정한 "
         "기대 보고주기(ITU-R M.1371-6 Table 1)와 실제 간격 비교, "
-        "② Type 1 SOTDMA 슬롯 체인(같은 슬롯 반복 / 슬롯 교체 예고)이 규정대로 이어지는지 검증합니다. "
-        "(ITDMA num_slots 검증은 이번 버전 제외)"
+        "② Type 1 SOTDMA 슬롯 체인을 **슬롯번호·프레임 정수 비교**로 검증합니다"
+        "(timeout 2/4/6 의 보고 슬롯번호=관측 슬롯, timeout 0 의 offset 예고 슬롯 점유, "
+        "timeout>0 의 같은 슬롯 유지·1감소 — 수신시각 허용오차 없음). "
+        "다음 프레임에 그 선박이 미수신되면 위반이 아니라 '검증 보류'로 두고 잡음층으로 "
+        "환경성/미상을 구분합니다. (ITDMA num_slots 검증은 이번 버전 제외)"
     )
 
     with st.expander("판정 임계값 조절", expanded=False):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         grid_tol = c1.slider("보고주기 격자 허용오차", 0.0, 0.5, 0.2, 0.02, key="rc_grid",
                              help="실제간격/기대간격 비율이 정수배(격자)에서 이 값 이내면 "
                                   "'격자 위'로 봄. 0=엄격(정확한 정수배만 정상 → 지터까지 위반). "
@@ -33,15 +36,16 @@ def render():
                                   "'보고 누락/정상'으로 완화됨")
         fast = c2.slider("과도 보고 배율 (기대×N 미만 시 위반)", 0.1, 0.9, 0.5, 0.05,
                          key="rc_fast", help="예: 기대 10초, 배율 0.5 → 5초 미만 시 '과도한 보고'")
-        tol = c3.slider("슬롯 시간 허용오차 (초)", 0.0, 10.0, 0.0, 0.1, key="rc_tol",
-                        help="다음 프레임(60초 뒤) 예고/반복 슬롯을 찾을 때 허용할 시간 오차 (기본 0=엄격)")
-        margin = c4.slider("수신한계 여유 (dB)", 3.0, 20.0, 10.0, 1.0, key="rc_margin",
+        margin = c3.slider("수신한계 여유 (dB)", 3.0, 20.0, 10.0, 1.0, key="rc_margin",
                            help="선박 RSSI가 잡음층+이 값 미만이면 '수신한계 근접'으로 판정. "
-                                "AIS 복조에 통상 ~10dB SNR 이 필요")
+                                "슬롯 검증에서 다음 프레임에 그 선박이 미수신됐을 때 이 기준으로 "
+                                "'환경성 유실 추정'과 '원인 미상'을 나눔. AIS 복조에 통상 ~10dB SNR 필요. "
+                                "※ 슬롯 검증은 슬롯번호·프레임 정수 비교라 시간 허용오차가 없음")
 
     enriched = data.get_enriched()
     noise_df = data.get_noise_floor()
-    df = logic.classify(enriched, fast_factor=fast, grid_tol=grid_tol, time_tol_sec=tol)
+    df = logic.classify(enriched, fast_factor=fast, grid_tol=grid_tol,
+                        noise_df=noise_df, decode_margin=margin)
 
     # ── MMSI 필터 (화면 전체에 적용) ─────────────────────────
     mmsi_opts = sorted(df["mmsi"].unique().tolist())
@@ -124,7 +128,8 @@ def _render_slot_map(df, noise_df, margin):
     n_a = int((fdf["channel"] == "A").sum())
     n_b = int((fdf["channel"] == "B").sum())
     st.caption(f"**{sel_ts:%Y-%m-%d %H:%M}** · 수신 {occ:,}건(A {n_a}·B {n_b}) · 위반 {viol}건 · "
-              "파랑=채널A, 청록=채널B, 빨강=위반 · 슬롯을 클릭하면 그 선박이 강조되고 아래 표가 필터됩니다")
+              "파랑=채널A, 청록=채널B, 빨강=위반, 회색=검증 보류(다음 프레임 미수신) · "
+              "슬롯을 클릭하면 그 선박이 강조되고 아래 표가 필터됩니다")
 
     # 선박 강조/필터: selectbox(확실) + 슬롯 클릭(보조) — 둘 다 같은 선택값을 씀
     vessels = sorted(fdf["mmsi"].unique().tolist())
