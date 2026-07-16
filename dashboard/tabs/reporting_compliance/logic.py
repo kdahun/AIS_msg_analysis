@@ -27,9 +27,9 @@ SLOTS_PER_FRAME = 2250
 # 사유 코드 → 한글 (여러 곳(표/차트 hover)에서 공유)
 # 위반 사유: 원그래프·MMSI 표에서 '위반'으로 집계된다.
 REASON_LABELS_KO = {
-    "RI_MISSED": "보고 누락(격자 위지만 중간에 빠짐)",
-    "RI_INTERVAL_BAD": "보고주기 부적합(간격이 규정 정수배와 안 맞음)",
     "RI_TOO_FAST": "과도한 보고(기대보다 빠름)",
+    "RI_INTERVAL_BAD": "보고주기 부적합(어느 정수배와도 안 맞음)",
+    "RI_UNDER_REPORT": "과소 보고(규정보다 느린 주기 — 유실 아님)",
     "SLOT_NUM_MISMATCH": "슬롯번호 불일치(보고 슬롯 ≠ 관측 슬롯)",
     "SLOT_REPEAT_MISSING": "슬롯 반복 누락(다음 프레임에 그 슬롯 미점유)",
     "SLOT_SWITCH_MISSING": "슬롯 교체 예고 불일치(예고 슬롯 미점유)",
@@ -37,29 +37,39 @@ REASON_LABELS_KO = {
     "TIMEOUT_REINIT_OUT_OF_RANGE": "timeout 재초기화 범위밖([3,7] 벗어남)",
 }
 
-# 검증 보류(위반 아님): 다음 프레임에 그 선박이 수신되지 않아 슬롯 체인을
-# 확인할 수 없는 경우. 그 시점 잡음층 대비 신호여유로 환경성/미상을 구분한다.
+# 검증 보류(위반 아님): 수신 유실 등으로 선박 탓이라 단정할 수 없는 경우.
+# 잡음층 대비 신호여유로 '환경성 유실 추정'과 '원인 미상'을 구분한다.
+#  · RI_LOST_*  : 보고 간격이 기대의 정수배(≥2)인데, 그 선박은 원래 규정 주기를
+#                 달성하므로 '이번 간격만 유실'로 본다(과소 보고와 반대).
+#  · SLOT_UNVERIF_* : 다음 프레임에 그 선박이 미수신돼 슬롯 체인 확인 불가.
 HOLD_LABELS_KO = {
+    "RI_LOST_NOISE": "보고 유실 추정(수신한계 근접 — 환경성)",
+    "RI_LOST_PENDING": "보고 유실(원인 미상 — 보류)",
     "SLOT_UNVERIF_NOISE": "검증보류(수신한계 근접 — 환경성 유실 추정)",
     "SLOT_UNVERIF_PENDING": "검증보류(다음 프레임 미수신 — 원인 미상)",
 }
 
-# 슬롯 사유 중 '진짜 위반'으로 집계할 코드(보류 코드는 is_violation 에서 제외)
+# '진짜 위반'으로 집계할 코드(보류 코드는 is_violation 에서 제외)
+RI_VIOLATION_CODES = frozenset({"RI_TOO_FAST", "RI_INTERVAL_BAD", "RI_UNDER_REPORT"})
+RI_HOLD_CODES = frozenset({"RI_LOST_NOISE", "RI_LOST_PENDING"})
 SLOT_VIOLATION_CODES = frozenset({
     "SLOT_NUM_MISMATCH", "SLOT_REPEAT_MISSING", "TIMEOUT_NOT_DECREMENTED",
     "SLOT_SWITCH_MISSING", "TIMEOUT_REINIT_OUT_OF_RANGE"})
-SLOT_HOLD_CODES = frozenset(HOLD_LABELS_KO)
+SLOT_HOLD_CODES = frozenset({"SLOT_UNVERIF_NOISE", "SLOT_UNVERIF_PENDING"})
 
+# 사유 뒤에 '~N배 간격'을 붙일 코드(간격이 기대의 몇 배인지 표기)
+_COUNT_CODES = RI_HOLD_CODES | {"RI_UNDER_REPORT"}
 _ALL_LABELS = {**REASON_LABELS_KO, **HOLD_LABELS_KO}
 
 
 def reason_ko(code: str, missed_count: int = 0) -> str:
-    """빈 문자열/None 은 '정상'으로. RI_MISSED 는 누락 개수를 붙인다."""
+    """빈 문자열/None 은 '정상'으로. 유실/과소 보고는 간격 배수를 붙인다."""
     if not code:
         return "정상"
-    if code == "RI_MISSED" and missed_count:
-        return f"보고 누락 {missed_count}개"
-    return _ALL_LABELS.get(code, code)
+    label = _ALL_LABELS.get(code, code)
+    if code in _COUNT_CODES and missed_count:
+        return f"{label} ~{missed_count + 1}배 간격"
+    return label
 
 
 def combined_reason_ko(ri_reason: str, slot_reason: str, missed_count: int = 0) -> str:
@@ -71,6 +81,11 @@ def combined_reason_ko(ri_reason: str, slot_reason: str, missed_count: int = 0) 
     return " / ".join(parts) if parts else "정상"
 FRAME_SEC = 60.0
 TMO_MIN, TMO_MAX = 3, 7
+
+# 보고주기 판정 파라미터
+SLOW_INTERVAL_TOL_SEC = 3.0   # 기대주기>60초(정박 등)는 프레임 고정 → 절대 ±초로 엄격
+UNDER_MIN_SAMPLES = 10        # 과소 보고 판정에 필요한 (같은 기대주기) 최소 간격 표본
+UNDER_FLOOR_RATIO = 1.5       # 달성 최소간격 비율(p10)이 이 이상이면 과소 보고로 봄
 
 
 # ── 보고주기: 기대 간격 ───────────────────────────────────────
@@ -128,6 +143,19 @@ def enrich_vessel(df: pd.DataFrame) -> pd.DataFrame:
         expected_interval_sec(s, st, cc)
         for s, st, cc in zip(df["speed"], df["status"], df["changing_course"])]
     df["actual_gap"] = df["vsi_time"].shift(-1).sub(df["vsi_time"]).dt.total_seconds()
+
+    # 과소 보고 판별용: 같은 기대주기 상태에서 이 선박이 달성하는 '가장 짧은' 간격
+    # 비율(p10). 수신 유실은 간격을 늘리기만 하므로, p10 이 여전히 크면(≈2배 이상)
+    # 선박이 원래 규정보다 느리게 쏘는 것(과소 보고), 1 근처면 규정 주기를 달성하는 것.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = df["actual_gap"].values / df["expected_interval"].values
+    floor = np.full(len(df), np.nan)
+    tmp = pd.DataFrame({"exp": df["expected_interval"].values, "r": r})
+    for _, grp in tmp.groupby("exp"):
+        rr = grp["r"].dropna()
+        if len(rr) >= UNDER_MIN_SAMPLES:
+            floor[grp.index.to_numpy()] = np.percentile(rr.values, 10)
+    df["achieved_ratio_floor"] = floor
 
     _enrich_slot_chain(df)
     return df
@@ -234,20 +262,20 @@ def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── classify (싸다, 슬라이더 임계값 적용) ────────────────────
-def _signal_margin_next_frame(df: pd.DataFrame, noise_df) -> np.ndarray:
-    """각 행의 (RSSI − 다음 프레임 잡음층)[dB]. 잡음층이 없으면 nan.
+def _signal_margin(df: pd.DataFrame, noise_df, offset_min: int = 0) -> np.ndarray:
+    """각 행의 (RSSI − 잡음층)[dB]. offset_min 프레임 뒤의 잡음층 기준. 없으면 nan.
 
-    다음 프레임에 그 선박이 수신되지 않았을 때, 그 시점 주변 잡음층(다른 선박들의
-    RSSI−SNR 중앙값) 대비 이 선박의 직전 RSSI 가 얼마나 여유가 있었는지를 본다.
-    여유가 작으면 신호가 잡음에 묻혀 못 받은 '환경성 유실'로 볼 근거가 된다.
+    그 시점 주변 잡음층(다른 선박들의 RSSI−SNR 중앙값) 대비 이 선박의 RSSI 여유.
+    여유가 작으면 신호가 잡음에 묻혀 유실됐을 '환경성' 근거가 된다.
+      offset_min=0 → 이 프레임(보고 유실 판정), 1 → 다음 프레임(슬롯 미수신 판정)
     """
     n = len(df)
     if noise_df is None or not len(noise_df):
         return np.full(n, np.nan)
     noise_by_frame = noise_df.set_index("frame")["noise_dbm"]
-    next_frame = df["frame"] + pd.Timedelta(minutes=1)
-    noise_next = next_frame.map(noise_by_frame).values
-    return df["vsi_rssi"].values - noise_next
+    tgt = df["frame"] + pd.Timedelta(minutes=offset_min)
+    noise = tgt.map(noise_by_frame).values
+    return df["vsi_rssi"].values - noise
 
 
 def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
@@ -255,11 +283,17 @@ def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
     """enrich 된 df 에 사용자 임계값을 적용해 사유 컬럼 생성(벡터화, 즉시).
     추가/갱신: ri_reason, ri_missed_count, slot_reason, is_violation
 
-    보고주기(시간 비율 → grid_tol/fast_factor 필요), 메시지마다 비율 = 실제간격/기대간격:
-      - 비율 < fast_factor            → 과도한 보고
-      - |비율 − round(비율)| ≤ grid_tol (규정 간격의 정수배 = '격자 위'):
-            round(비율) ≥ 2 → 보고 누락 (round-1 개)  /  아니면 정상
-      - 정수배에서 벗어남              → 보고주기 부적합
+    보고주기(메시지마다 비율 = 실제간격/기대간격, k = round(비율)):
+      - 비율 < fast_factor            → 과도한 보고 (RI_TOO_FAST)
+      - |실제 − k·기대| ≤ 허용오차:
+          허용오차 = grid_tol·기대  (기대 ≤ 60초, SOTDMA 선택구간 ±0.2·NI 근거)
+                   = SLOW_INTERVAL_TOL_SEC (기대 > 60초, 정박 등 프레임 고정 → 절대 ±초로 엄격)
+          k = 1 → 정상
+          k ≥ 2 → 간격이 기대의 정수배. 이 선박의 달성 최소간격(achieved_ratio_floor)으로 구분:
+              floor ≥ UNDER_FLOOR_RATIO → 과소 보고(RI_UNDER_REPORT, 위반: 원래 느리게 쏨)
+              그 외 → 이번 간격만 유실(위반 아님). 신호여유(RSSI − 이 프레임 잡음층)로
+                      < decode_margin → 환경성 유실(RI_LOST_NOISE) / 그 외 → 원인 미상(RI_LOST_PENDING)
+      - 어느 정수배와도 안 맞음 (|실제 − k·기대| > 허용오차) → 보고주기 부적합 (RI_INTERVAL_BAD)
 
     슬롯 체인(이산 검증 → 허용오차 없음, enrich 에서 산출한 지표를 그대로 적용):
       - to∈{2,4,6} sub_message≠vsi_slot → 슬롯번호 불일치
@@ -267,28 +301,37 @@ def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
           repeat: 그 슬롯 미점유→반복누락 / 점유했으나 timeout≠to-1→미감소
           switch: 예고슬롯 미점유→예고불일치 / 점유했으나 timeout∉[3,7]→재초기화범위밖
       - 다음 프레임 미수신(¬heard) → 위반이 아니라 '검증 보류':
-          (RSSI − 다음프레임 잡음층) < decode_margin → 환경성 유실 추정
-          그 외/알수없음                              → 원인 미상
+          (RSSI − 다음프레임 잡음층) < decode_margin → 환경성 유실 추정 / 그 외 → 원인 미상
     """
     df = df.copy()
     # ── 보고주기 ──
     exp = df["expected_interval"].values
     act = df["actual_gap"].values
+    floor = df["achieved_ratio_floor"].values
     ri = np.full(len(df), "", dtype=object)
     missed = np.zeros(len(df), dtype=int)
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = act / exp
         k = np.round(ratio)
-        dev = np.abs(ratio - k)
+        dev_time = np.abs(act - k * exp)                    # 정수배로부터의 시간 편차(초)
+        allowed = np.where(exp <= 60.0, grid_tol * exp, SLOW_INTERVAL_TOL_SEC)
         valid = ~np.isnan(act)
         too_fast = valid & (ratio < fast_factor)
-        on_grid = valid & ~too_fast & (dev <= grid_tol)
-        off_grid = valid & ~too_fast & (dev > grid_tol)
-        missed_case = on_grid & (k >= 2)
+        on_grid = valid & ~too_fast & (dev_time <= allowed)
+        off_grid = valid & ~too_fast & (dev_time > allowed)
+        long_gap = on_grid & (k >= 2)                       # 기대의 정수배(≥2) = 누락 후보
+        under = long_gap & (floor >= UNDER_FLOOR_RATIO)     # floor nan → False → 유실로
+        loss = long_gap & ~under
         ri[too_fast] = "RI_TOO_FAST"
         ri[off_grid] = "RI_INTERVAL_BAD"
-        ri[missed_case] = "RI_MISSED"
-        missed[missed_case] = (k[missed_case] - 1).astype(int)
+        ri[under] = "RI_UNDER_REPORT"
+        missed[long_gap] = (k[long_gap] - 1).astype(int)
+    # 유실(선박은 규정 주기 달성하지만 이 간격만 김)을 환경/보류로 분리
+    if loss.any():
+        margin = _signal_margin(df, noise_df, offset_min=0)
+        lost_noise = loss & (margin < decode_margin)        # margin nan → False → pending
+        ri[loss & ~lost_noise] = "RI_LOST_PENDING"
+        ri[lost_noise] = "RI_LOST_NOISE"
     df["ri_missed_count"] = missed
 
     # ── 슬롯 체인 (이산, 허용오차 없음) ──
@@ -313,7 +356,7 @@ def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
         # 다음 프레임 미수신 → 검증 보류(위반 아님): 잡음층으로 환경성/미상 구분
         unheard = (rep | sw) & ~heard
         if unheard.any():
-            margin = _signal_margin_next_frame(df, noise_df)
+            margin = _signal_margin(df, noise_df, offset_min=1)
             env = unheard & (margin < decode_margin)     # margin nan → False → pending
             slot[unheard & ~env] = "SLOT_UNVERIF_PENDING"
             slot[env] = "SLOT_UNVERIF_NOISE"
@@ -323,6 +366,7 @@ def classify(df: pd.DataFrame, fast_factor=0.5, grid_tol=0.2,
 
     df["ri_reason"] = ri
     df["slot_reason"] = slot
+    ri_is_viol = np.array([r in RI_VIOLATION_CODES for r in ri])
     slot_is_viol = np.array([s in SLOT_VIOLATION_CODES for s in slot])
-    df["is_violation"] = (ri != "") | slot_is_viol
+    df["is_violation"] = ri_is_viol | slot_is_viol
     return df

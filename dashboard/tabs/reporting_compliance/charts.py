@@ -30,17 +30,20 @@ _COLORSCALE = [[0.0, "#161B26"], [0.33, "#161B26"],
 def category_series(df):
     """메시지별 카테고리 Series (정상/보고주기 위반/슬롯 위반/둘 다 위반/검증 보류).
 
-    '검증 보류'는 위반이 아니라 다음 프레임 미수신으로 슬롯 체인을 확인 못한 경우.
-    보고주기 위반이 함께 있으면 그건 확정 위반이므로 위반 쪽으로 분류한다.
+    '검증 보류'는 위반이 아니라 수신 유실 등으로 선박 탓이라 단정 못하는 경우
+    (보고 유실 RI_LOST_* / 슬롯 미수신 SLOT_UNVERIF_*). 위반이 하나라도 있으면
+    확정 위반으로 분류한다.
     """
-    ri = df["ri_reason"].values != ""
+    ri_code = df["ri_reason"].values.astype(str)
     slot_code = df["slot_reason"].values.astype(str)
+    ri_viol = np.array([r in logic.RI_VIOLATION_CODES for r in ri_code])
+    ri_hold = np.array([r in logic.RI_HOLD_CODES for r in ri_code])
     slot_viol = np.array([s in logic.SLOT_VIOLATION_CODES for s in slot_code])
     slot_hold = np.array([s in logic.SLOT_HOLD_CODES for s in slot_code])
-    cat = np.where(ri & slot_viol, "둘 다 위반",
-          np.where(ri, "보고주기 위반",
+    cat = np.where(ri_viol & slot_viol, "둘 다 위반",
+          np.where(ri_viol, "보고주기 위반",
           np.where(slot_viol, "슬롯 위반",
-          np.where(slot_hold, "검증 보류", "정상"))))
+          np.where(ri_hold | slot_hold, "검증 보류", "정상"))))
     return pd.Series(cat, index=df.index)
 
 
