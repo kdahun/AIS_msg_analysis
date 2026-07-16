@@ -111,12 +111,18 @@ def channel_slot_map(channel_df, channel: str):
     return fig
 
 
-def combined_slot_map(frame_df, highlight_mmsi=None):
-    """채널 A/B 를 한 그리드(75×30)에 통합한 슬롯맵. 클릭 선택 지원(scattergl).
+# 통합 슬롯맵 격자: 50×45 = 2250 (정사각에 가까워 셀이 크게 보임)
+MAP_COLS, MAP_ROWS = 50, 45
 
-    - 채널 A = 파랑, 채널 B = 청록, 위반 = 빨강 (채널 무관)
-    - A 마커는 셀 왼쪽(x-0.2), B 마커는 오른쪽(x+0.2)에 찍어 한 슬롯에 두 채널이
+
+def combined_slot_map(frame_df, highlight_mmsi=None):
+    """채널 A/B 를 한 그리드(50×45)에 통합한 슬롯맵. 클릭 선택 지원(scattergl).
+
+    - 채널 A = 파랑, 채널 B = 청록, 위반 = 빨강, 검증 보류 = 회색 (채널 무관)
+    - A 마커는 셀 왼쪽(x-0.22), B 마커는 오른쪽(x+0.22)에 찍어 한 슬롯에 두 채널이
       같이 와도 겹치지 않게 구분
+    - 격자선(그래프용지식) + 좌표축 라벨(행=슬롯 시작번호, 열=+0~+49)로 슬롯 위치를
+      눈으로 바로 읽을 수 있게 함. 슬롯 = 행 라벨 + 열 번호. hover 로 정확한 슬롯 확인.
     - highlight_mmsi 지정 시 그 선박의 슬롯을 크게+흰 테두리로 강조
     - customdata=[mmsi, ...] 로 클릭 시 MMSI 를 회수
     frame_df columns=[vsi_slot, mmsi, msg_type, channel, is_violation,
@@ -128,8 +134,8 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
         if sub.empty:
             return
         slot = sub["vsi_slot"].astype(int).values
-        x = (slot % GRID_COLS) + offset
-        y = slot // GRID_COLS
+        x = (slot % MAP_COLS) + offset
+        y = slot // MAP_COLS
         texts = []
         for r in sub.itertuples(index=False):
             reason = logic.combined_reason_ko(r.ri_reason, r.slot_reason,
@@ -142,8 +148,8 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
                          f"RSSI {rssi} · SNR {snr} · 거리 {dist}")
         fig.add_trace(go.Scattergl(
             x=x, y=y, mode="markers", name=name,
-            marker=dict(color=color, size=6, symbol="square",
-                        line=dict(width=0)),
+            marker=dict(color=color, size=11, symbol="square",
+                        line=dict(width=0.7, color="#0E1117")),
             customdata=sub["mmsi"].values, text=texts,
             hovertemplate="%{text}<extra></extra>"))
 
@@ -151,37 +157,50 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
     viol = frame_df[frame_df["is_violation"]]
     held = frame_df[hold]
     ok = frame_df[~frame_df["is_violation"] & ~hold]
-    _add(ok[ok["channel"] == "A"], _CH_COLOR["A"], "채널 A (정상)", -0.2)
-    _add(ok[ok["channel"] == "B"], _CH_COLOR["B"], "채널 B (정상)", +0.2)
+    _add(ok[ok["channel"] == "A"], _CH_COLOR["A"], "채널 A (정상)", -0.22)
+    _add(ok[ok["channel"] == "B"], _CH_COLOR["B"], "채널 B (정상)", +0.22)
     # 검증 보류(다음 프레임 미수신)는 회색
-    _add(held[held["channel"] == "A"], _HOLD_COLOR, "검증 보류", -0.2)
-    _add(held[held["channel"] == "B"], _HOLD_COLOR, "검증 보류", +0.2)
+    _add(held[held["channel"] == "A"], _HOLD_COLOR, "검증 보류", -0.22)
+    _add(held[held["channel"] == "B"], _HOLD_COLOR, "검증 보류", +0.22)
     # 위반은 채널별 위치는 유지하되 색만 빨강
     va = viol[viol["channel"] == "A"]; vb = viol[viol["channel"] == "B"]
-    _add(va, _VIOL_COLOR, "위반", -0.2)
-    _add(vb, _VIOL_COLOR, "위반", +0.2)
+    _add(va, _VIOL_COLOR, "위반", -0.22)
+    _add(vb, _VIOL_COLOR, "위반", +0.22)
 
     if highlight_mmsi is not None:
         hs = frame_df[frame_df["mmsi"] == highlight_mmsi]
         if not hs.empty:
             slot = hs["vsi_slot"].astype(int).values
-            offs = np.where(hs["channel"].values == "A", -0.2, 0.2)
+            offs = np.where(hs["channel"].values == "A", -0.22, 0.22)
             fig.add_trace(go.Scattergl(
-                x=(slot % GRID_COLS) + offs, y=slot // GRID_COLS,
+                x=(slot % MAP_COLS) + offs, y=slot // MAP_COLS,
                 mode="markers", name=f"선택: {highlight_mmsi}",
-                marker=dict(color="rgba(0,0,0,0)", size=13, symbol="square",
-                            line=dict(width=2, color="#FFFFFF")),
+                marker=dict(color="rgba(0,0,0,0)", size=20, symbol="square",
+                            line=dict(width=2.5, color="#FFFFFF")),
                 hoverinfo="skip", showlegend=True))
 
-    fig.update_yaxes(autorange="reversed", showticklabels=False, showgrid=False,
-                     range=[-0.5, GRID_ROWS - 0.5], scaleanchor="x", scaleratio=1)
-    fig.update_xaxes(showticklabels=False, showgrid=False, range=[-0.7, GRID_COLS - 0.3])
+    _grid = dict(showgrid=True, gridcolor="rgba(255,255,255,0.12)", gridwidth=1,
+                 minor=dict(dtick=1, showgrid=True,
+                            gridcolor="rgba(255,255,255,0.05)", gridwidth=1))
+    # y축(행): 라벨 = 그 행의 시작 슬롯 번호(행×50), 2행마다 → 0,100,...,2200
+    fig.update_yaxes(
+        range=[MAP_ROWS - 0.5, -0.5], scaleanchor="x", scaleratio=1, zeroline=False,
+        tickmode="array", tickvals=list(range(0, MAP_ROWS, 2)),
+        ticktext=[str(r * MAP_COLS) for r in range(0, MAP_ROWS, 2)],
+        tickfont=dict(size=9), ticks="outside", ticklen=3, **_grid)
+    # x축(열): +0 ~ +49, 10칸마다 라벨
+    fig.update_xaxes(
+        range=[-0.7, MAP_COLS - 0.3], zeroline=False,
+        tickmode="array", tickvals=list(range(0, MAP_COLS, 10)),
+        ticktext=[f"+{c}" for c in range(0, MAP_COLS, 10)],
+        tickfont=dict(size=9), ticks="outside", ticklen=3, **_grid)
     fig.update_layout(
-        template=_TEMPLATE, height=480, margin=dict(t=28, b=6, l=6, r=6),
+        template=_TEMPLATE, height=680, margin=dict(t=30, b=6, l=6, r=6),
         plot_bgcolor="#0E1117", clickmode="event+select",
-        legend=dict(orientation="h", y=1.04),
-        title=dict(text="슬롯 0(좌상) → 2249(우하) · 셀 왼쪽=채널A, 오른쪽=채널B · 슬롯 클릭 시 그 선박 강조",
-                   font=dict(size=12), x=0.01, y=0.99))
+        legend=dict(orientation="h", y=1.03),
+        title=dict(text="슬롯 = 왼쪽 행번호 + 상단 열번호 (예: 행 500 · 열 +7 → 슬롯 507) · "
+                        "셀 왼쪽=채널A, 오른쪽=채널B · 드래그로 확대, 슬롯 클릭 시 그 선박 강조",
+                   font=dict(size=11), x=0.01, y=0.995))
     return fig
 
 
