@@ -118,7 +118,7 @@ def channel_slot_map(channel_df, channel: str):
 MAP_COLS, MAP_ROWS = 50, 45
 
 
-def combined_slot_map(frame_df, highlight_mmsi=None):
+def combined_slot_map(frame_df, highlight_mmsi=None, losses=None):
     """채널 A/B 를 한 그리드(50×45)에 통합한 슬롯맵. 클릭 선택 지원(scattergl).
 
     - 채널 A = 파랑, 채널 B = 청록, 위반 = 빨강, 검증 보류 = 회색 (채널 무관)
@@ -128,6 +128,8 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
       눈으로 바로 읽을 수 있게 함. 슬롯 = 행 라벨 + 열 번호. hover 로 정확한 슬롯 확인.
     - highlight_mmsi 지정 시 그 선박의 슬롯을 크게+흰 테두리로 강조
     - customdata=[mmsi, ...] 로 클릭 시 MMSI 를 회수
+    - losses: 이 프레임의 슬롯 특정 유실 rows(columns: slot, channel, mmsi,
+      est_rssi, is_env). 빈 사각(테두리만)으로 표시 — 주황=환경성, 회색=원인미상.
     frame_df columns=[vsi_slot, mmsi, msg_type, channel, is_violation,
                       ri_reason, slot_reason, ri_missed_count, vsi_rssi, vsi_snr, dist_km]
     """
@@ -169,6 +171,26 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
     va = viol[viol["channel"] == "A"]; vb = viol[viol["channel"] == "B"]
     _add(va, _VIOL_COLOR, "위반", -0.22)
     _add(vb, _VIOL_COLOR, "위반", +0.22)
+
+    # 유실(수신 못한 예약 슬롯): 테두리만 있는 빈 사각형
+    if losses is not None and len(losses):
+        for env, color, name in [(True, "#F2A33C", "유실(환경성 추정)"),
+                                 (False, "#9AA3B2", "유실(원인 미상)")]:
+            sub = losses[losses["is_env"] == env]
+            if sub.empty:
+                continue
+            slot = sub["slot"].astype(int).values
+            offs = np.where(sub["channel"].values == "A", -0.22, 0.22)
+            texts = [f"유실 · 슬롯 {int(r.slot)} · 채널 {r.channel} · MMSI {r.mmsi}"
+                     f"<br>추정 RSSI {r.est_rssi:.0f} dBm (양옆 수신 평균)"
+                     for r in sub.itertuples()]
+            fig.add_trace(go.Scattergl(
+                x=(slot % MAP_COLS) + offs, y=slot // MAP_COLS,
+                mode="markers", name=name,
+                marker=dict(color="rgba(0,0,0,0)", size=10, symbol="square",
+                            line=dict(width=1.5, color=color)),
+                customdata=sub["mmsi"].values, text=texts,
+                hovertemplate="%{text}<extra></extra>"))
 
     if highlight_mmsi is not None:
         hs = frame_df[frame_df["mmsi"] == highlight_mmsi]
@@ -312,6 +334,37 @@ def intrusion_rssi_timeline(hist_df, victim, intruder, ev_frame, slot, channel):
                         "지키던 슬롯에 침범자(빨강 다이아)가 더 강한 신호로 등장",
                    font=dict(size=12), x=0.01),
         yaxis_title="RSSI (dBm)", xaxis_title="수신 시각")
+    return fig
+
+
+def loss_timeline(loss_per_bucket: pd.Series, noise_df, bucket_min: int):
+    """시간대별 유실 추이(막대) + 잡음층(보조축 선) — 잡음이 오를 때 유실이
+    늘어나는지(환경 요인) 한눈에 비교.
+
+    loss_per_bucket: index=bucket 시각, value=유실 보고 수
+    noise_df: columns=[frame, noise_dbm]
+    """
+    from plotly.subplots import make_subplots
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=loss_per_bucket.index, y=loss_per_bucket.values, name="유실 보고 수",
+        marker_color="#F2A33C", opacity=0.85,
+        hovertemplate="%{x}<br>유실 %{y}건<extra></extra>"), secondary_y=False)
+    if noise_df is not None and len(noise_df):
+        nb = (noise_df.set_index("frame")["noise_dbm"]
+              .resample(f"{bucket_min}min").median())
+        fig.add_trace(go.Scatter(
+            x=nb.index, y=nb.values, name="잡음층(중앙값)",
+            line=dict(color="#FF5C5C", width=1.5, dash="dash"),
+            hovertemplate="%{x}<br>잡음층 %{y:.0f} dBm<extra></extra>"),
+            secondary_y=True)
+    fig.update_layout(
+        template=_TEMPLATE, height=340, margin=dict(t=30, b=10, l=10, r=10),
+        plot_bgcolor="#0E1117", legend=dict(orientation="h", y=1.12),
+        title=dict(text=f"{bucket_min}분 단위 유실 보고 수 · 빨간 점선=잡음층(dBm, 오른쪽 축)",
+                   font=dict(size=12), x=0.01))
+    fig.update_yaxes(title_text="유실 보고 수", secondary_y=False)
+    fig.update_yaxes(title_text="잡음층 (dBm)", secondary_y=True, showgrid=False)
     return fig
 
 

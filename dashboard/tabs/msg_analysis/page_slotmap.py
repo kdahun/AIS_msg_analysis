@@ -48,12 +48,21 @@ def render():
         st.info(f"{sel_ts:%m-%d %H:%M} 프레임에는 수신된 메시지가 없습니다.")
         return
 
+    # 이 프레임의 슬롯 특정 유실(빈 사각) + 환경성 여부(신호여유 < margin)
+    losses_all = data.get_bundle()["losses"]
+    flo = losses_all[losses_all["frame"] == sel_ts]
+    if len(flo):
+        noise_now = noise_df.set_index("frame")["noise_dbm"].get(sel_ts)
+        flo = flo.assign(is_env=(flo["est_rssi"] - noise_now < margin)
+                         if noise_now is not None else False)
+
     occ = len(fdf)
     viol = int(fdf["is_violation"].sum())
     n_a = int((fdf["channel"] == "A").sum())
     n_b = int((fdf["channel"] == "B").sum())
     st.caption(f"**{sel_ts:%Y-%m-%d %H:%M}** · 수신 {occ:,}건(A {n_a}·B {n_b}) · 위반 {viol}건 · "
-              "파랑=채널A, 청록=채널B, 빨강=위반, 회색=검증 보류(다음 프레임 미수신) · "
+              f"**유실 {len(flo)}건**(수신 총계 미포함, 빈 사각형: 주황=환경성·회색=미상) · "
+              "파랑=채널A, 청록=채널B, 빨강=위반, 회색=검증 보류 · "
               "슬롯을 클릭하면 그 선박이 강조되고 아래 표가 필터됩니다")
 
     # 선박 강조/필터: selectbox(확실) + 슬롯 클릭(보조) — 둘 다 같은 선택값을 씀
@@ -67,7 +76,8 @@ def render():
         format_func=lambda m: "(선택 안 함)" if m is None else f"MMSI {m}",
         key="rc_sel_box")
 
-    fig = charts.combined_slot_map(fdf, highlight_mmsi=sel_mmsi)
+    fig = charts.combined_slot_map(fdf, highlight_mmsi=sel_mmsi,
+                                   losses=flo if len(flo) else None)
     event = st.plotly_chart(fig, use_container_width=True,
                             key=f"rc_map_{st.session_state.rc_frame_idx}",
                             on_select="rerun", selection_mode="points")

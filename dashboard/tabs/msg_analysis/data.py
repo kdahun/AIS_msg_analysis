@@ -84,6 +84,7 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     noise = ((enriched["vsi_rssi"] - enriched["vsi_snr"])
              .groupby(enriched["frame"]).median().rename("noise_dbm").reset_index())
     intrusions = logic.detect_intrusions(enriched)
+    losses = logic.build_loss_layer(enriched)
 
     CACHE_DIR.mkdir(exist_ok=True)
     for old in CACHE_DIR.glob("*.parquet"):      # 이전 키 캐시 정리
@@ -91,29 +92,32 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     enriched.to_parquet(CACHE_DIR / f"enriched_{key}.parquet")
     noise.to_parquet(CACHE_DIR / f"noise_{key}.parquet")
     intrusions.to_parquet(CACHE_DIR / f"intrusions_{key}.parquet")
-    return enriched, noise, intrusions
+    losses.to_parquet(CACHE_DIR / f"losses_{key}.parquet")
+    return enriched, noise, intrusions, losses
+
+
+_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses")
 
 
 @st.cache_resource(show_spinner="메시지 분석 데이터 준비 중... (데이터 변경 시에만 오래 걸립니다)")
 def get_bundle() -> dict:
     """전체 프리컴퓨트 번들. 반환 dict 의 DataFrame 은 수정 금지(공유).
 
-    keys: enriched, noise, intrusions, frames(정렬된 프레임 배열),
-          frame_idx(frame→행위치 ndarray)
+    keys: enriched, noise, intrusions, losses(슬롯 특정 유실 레이어),
+          frames(정렬된 프레임 배열), frame_idx(frame→행위치 ndarray)
     """
     key = _cache_key()
-    paths = {n: CACHE_DIR / f"{n}_{key}.parquet"
-             for n in ("enriched", "noise", "intrusions")}
+    paths = {n: CACHE_DIR / f"{n}_{key}.parquet" for n in _BUNDLE_PARTS}
     if all(p.exists() for p in paths.values()):
-        enriched, noise, intrusions = (pd.read_parquet(paths[n])
-                                       for n in ("enriched", "noise", "intrusions"))
+        enriched, noise, intrusions, losses = (pd.read_parquet(paths[n])
+                                               for n in _BUNDLE_PARTS)
     else:
-        enriched, noise, intrusions = _precompute(key)
+        enriched, noise, intrusions, losses = _precompute(key)
 
     frame_idx = enriched.groupby("frame").indices          # {Timestamp: ndarray}
     frames = np.array(sorted(frame_idx.keys()))
     return dict(enriched=enriched, noise=noise, intrusions=intrusions,
-                frames=frames, frame_idx=frame_idx)
+                losses=losses, frames=frames, frame_idx=frame_idx)
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)

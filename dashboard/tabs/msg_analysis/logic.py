@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 # enrich 결과(디스크 캐시)의 스키마/의미가 바뀔 때마다 올린다 → 캐시 자동 무효화
-LOGIC_VERSION = 2
+LOGIC_VERSION = 3
 
 # sentinel
 HEADING_NA = 511
@@ -262,6 +262,43 @@ def _enrich_slot_chain(df: pd.DataFrame):
 def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
     parts = [enrich_vessel(g) for _, g in df.groupby("mmsi", sort=False)]
     return pd.concat(parts, ignore_index=True)
+
+
+# ── 슬롯 특정 유실 (오차/배율 무관 → 프리컴퓨트 대상) ─────────
+def build_loss_layer(df: pd.DataFrame) -> pd.DataFrame:
+    """timeout 카운트다운 런 안에서 '브라킷된 빈 프레임' = 슬롯 특정 유실.
+
+    같은 (mmsi, 채널, 슬롯)의 연속 두 수신이 프레임 d칸 떨어져 있고
+    timeout 이 정확히 d 만큼 감소했다면(t2 == t1 − d), 그 사이 d−1 개
+    프레임에도 같은 슬롯으로 송신했음이 확실하다(예약 규칙) — 수신만 못한 것.
+    그 빈 프레임들을 유실 행으로 만든다. 수신 메시지가 아니므로 별도 레이어.
+
+    반환 columns: mmsi, channel, slot, frame, est_rssi(양옆 평균), gap_frames
+    """
+    cols = ["mmsi", "channel", "slot", "frame", "est_rssi", "gap_frames"]
+    t1 = df[(df["msg_type"] == 1) & df["slot_timeout"].notna()
+            & df["channel"].isin(["A", "B"])]
+    if t1.empty:
+        return pd.DataFrame(columns=cols)
+
+    s = (t1[["mmsi", "channel", "vsi_slot", "frame", "slot_timeout", "vsi_rssi"]]
+         .sort_values(["mmsi", "channel", "vsi_slot", "frame"]))
+    grp = s.groupby(["mmsi", "channel", "vsi_slot"])
+    prev_frame = grp["frame"].shift(1)
+    prev_to = grp["slot_timeout"].shift(1)
+    prev_rssi = grp["vsi_rssi"].shift(1)
+    d = (s["frame"] - prev_frame).dt.total_seconds() / 60.0
+    consistent = (d >= 2) & (prev_to - d == s["slot_timeout"])
+
+    out = []
+    sub = s[consistent].assign(gap_d=d[consistent], p_rssi=prev_rssi[consistent],
+                               p_frame=prev_frame[consistent])
+    for r in sub.itertuples(index=False):
+        est = np.nanmean([r.p_rssi, r.vsi_rssi])
+        for j in range(1, int(r.gap_d)):
+            out.append((r.mmsi, r.channel, int(r.vsi_slot),
+                        r.p_frame + pd.Timedelta(minutes=j), est, int(r.gap_d) - 1))
+    return pd.DataFrame(out, columns=cols)
 
 
 # ── 슬롯 침범 탐지 (오차/배율 무관 → 프리컴퓨트 대상) ─────────

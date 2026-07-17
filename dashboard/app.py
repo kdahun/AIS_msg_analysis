@@ -13,7 +13,9 @@ st.set_page_config(page_title="AIS 분석 대시보드", page_icon="📡", layou
 from tabs import (  # noqa: E402  (set_page_config 이후 import)
     rssi_snr_by_mmsi, rssi_snr_by_time, rssi_snr_by_message, signal_validity,
 )
-from tabs.msg_analysis import page_reporting, page_slotmap, page_intrusion  # noqa: E402
+from tabs.msg_analysis import (  # noqa: E402
+    page_reporting, page_slotmap, page_intrusion, page_loss, page_quality,
+)
 
 _PAGES = {
     "📡 AIS RSSI/SNR 분석": [
@@ -26,6 +28,8 @@ _PAGES = {
         (page_reporting, "msg-reporting"),
         (page_slotmap, "msg-slotmap"),
         (page_intrusion, "msg-intrusion"),
+        (page_loss, "msg-loss"),
+        (page_quality, "msg-quality"),
     ],
 }
 
