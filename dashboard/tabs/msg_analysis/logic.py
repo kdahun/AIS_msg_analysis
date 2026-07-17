@@ -14,6 +14,9 @@
 import numpy as np
 import pandas as pd
 
+# enrich 결과(디스크 캐시)의 스키마/의미가 바뀔 때마다 올린다 → 캐시 자동 무효화
+LOGIC_VERSION = 1
+
 # sentinel
 HEADING_NA = 511
 COURSE_NA = 360.0

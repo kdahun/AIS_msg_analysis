@@ -12,3 +12,6 @@ __pycache__/
 
 # Streamlit secrets (DB 접속정보)
 dashboard/.streamlit/secrets.toml
+
+# 프리컴퓨트 디스크 캐시 (자동 생성)
+dashboard/data_cache/

@@ -1,18 +1,5 @@
-"""탭 레지스트리.
+"""페이지 모듈 패키지.
 
-새 탭 추가 방법:
-  1) tabs/ 에 파일을 만들고 `TITLE`(문자열)과 `render()`(함수)를 정의
-  2) 아래 import 와 TABS 리스트에 한 줄 추가
-
-app.py 는 이 목록만 보고 탭을 그리므로 수정할 필요가 없다.
+각 모듈은 `TITLE`(문자열)과 `render()`(함수)를 정의한다.
+페이지 등록은 app.py 의 _PAGES 에서 한다 (대분류 → [(모듈, url_path), ...]).
 """
-from . import rssi_snr_by_mmsi, rssi_snr_by_time, rssi_snr_by_message, signal_validity
-from . import reporting_compliance
-
-TABS = [
-    rssi_snr_by_mmsi,
-    rssi_snr_by_time,
-    rssi_snr_by_message,
-    signal_validity,
-    reporting_compliance,
-]
