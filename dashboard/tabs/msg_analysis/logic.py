@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 # enrich 결과(디스크 캐시)의 스키마/의미가 바뀔 때마다 올린다 → 캐시 자동 무효화
-LOGIC_VERSION = 1
+LOGIC_VERSION = 2
 
 # sentinel
 HEADING_NA = 511
@@ -262,6 +262,75 @@ def _enrich_slot_chain(df: pd.DataFrame):
 def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
     parts = [enrich_vessel(g) for _, g in df.groupby("mmsi", sort=False)]
     return pd.concat(parts, ignore_index=True)
+
+
+# ── 슬롯 침범 탐지 (오차/배율 무관 → 프리컴퓨트 대상) ─────────
+def detect_intrusions(df: pd.DataFrame) -> pd.DataFrame:
+    """'살아있는 예약 슬롯을 다른 선박이 차지한' 이벤트를 찾는다.
+
+    정의(모두 관측된 positive 사실):
+      · 피해자 F: 프레임 N−1 에서 (채널,슬롯 S)를 slot_timeout ≥ 1 로 송신
+        → SOTDMA 규칙상 프레임 N 에도 S 를 써야 함(예약이 살아있음)
+      · 침범자 G(≠F): 프레임 N 의 S 에서 수신됨, F 는 그 (채널,슬롯,프레임)에 없음
+      · f_returns: F 가 프레임 N+1 에 S 로 복귀(예약 지속 확증 — 브라킷)
+    F 가 실제로 N 에 송신했는지(물리적 비트충돌 여부)는 수신 데이터로 확정
+    불가하므로, 이벤트는 '예약 침범'으로 명명하고 위반 집계와는 분리해 둔다.
+
+    반환 columns: channel, slot, frame, victim, victim_timeout_prev,
+      victim_rssi, victim_dist, intruder, intruder_rssi, intruder_dist,
+      f_returns, victim_rssi_after
+    """
+    cols = ["channel", "slot", "frame", "victim", "victim_timeout_prev",
+            "victim_rssi", "victim_dist", "intruder", "intruder_rssi",
+            "intruder_dist", "f_returns", "victim_rssi_after"]
+    t1 = df[(df["msg_type"] == 1) & df["slot_timeout"].notna()
+            & df["channel"].isin(["A", "B"])]
+    if t1.empty:
+        return pd.DataFrame(columns=cols)
+
+    occ = pd.DataFrame({
+        "channel": t1["channel"].values, "slot": t1["vsi_slot"].astype(int).values,
+        "frame": t1["frame"].values, "mmsi": t1["mmsi"].values,
+        "timeout": t1["slot_timeout"].astype(int).values,
+        "rssi": t1["vsi_rssi"].values, "dist": t1["dist_km"].values})
+
+    # 예약자: timeout>=1 → 다음 프레임의 그 슬롯을 예약. 슬롯당 최강 RSSI 대표.
+    res = occ[occ["timeout"] >= 1].copy()
+    res["frame"] = res["frame"] + pd.Timedelta(minutes=1)
+    res = (res.sort_values("rssi", ascending=False)
+              .drop_duplicates(["channel", "slot", "frame"])
+              .rename(columns={"mmsi": "victim", "timeout": "victim_timeout_prev",
+                               "rssi": "victim_rssi", "dist": "victim_dist"}))
+
+    # 이번 프레임 점유자에 예약자 정보를 붙임
+    m = occ.merge(res, on=["channel", "slot", "frame"], how="inner")
+    if m.empty:
+        return pd.DataFrame(columns=cols)
+
+    # 그 (채널,슬롯,프레임)에 피해자 본인이 있으면 침범 아님(정상 반복)
+    key = ["channel", "slot", "frame"]
+    victim_present = (m[m["mmsi"] == m["victim"]][key].drop_duplicates()
+                      .assign(_vp=True))
+    m = m.merge(victim_present, on=key, how="left")
+    cand = m[(m["_vp"].isna()) & (m["mmsi"] != m["victim"])]
+    if cand.empty:
+        return pd.DataFrame(columns=cols)
+
+    # 슬롯·프레임당 최강 침범자 1명으로 요약
+    ev = (cand.sort_values("rssi", ascending=False).drop_duplicates(key)
+              .rename(columns={"mmsi": "intruder", "rssi": "intruder_rssi",
+                               "dist": "intruder_dist"}))
+
+    # 브라킷: 피해자가 다음 프레임에 그 슬롯으로 복귀했는가 (+복귀 RSSI)
+    nxt = occ[["channel", "slot", "frame", "mmsi", "rssi"]].copy()
+    nxt["frame"] = nxt["frame"] - pd.Timedelta(minutes=1)
+    nxt = (nxt.rename(columns={"mmsi": "victim", "rssi": "victim_rssi_after"})
+              .sort_values("victim_rssi_after", ascending=False)
+              .drop_duplicates(key + ["victim"]))
+    ev = ev.merge(nxt, on=key + ["victim"], how="left")
+    ev["f_returns"] = ev["victim_rssi_after"].notna()
+
+    return ev[cols].sort_values("frame").reset_index(drop=True)
 
 
 # ── classify (싸다, 슬라이더 임계값 적용) ────────────────────

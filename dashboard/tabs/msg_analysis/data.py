@@ -69,8 +69,8 @@ def _cache_key() -> str:
     return f"v{logic.LOGIC_VERSION}_{n}_{pd.Timestamp(t):%Y%m%d%H%M%S}"
 
 
-def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """SQL 로드 → enrich → 잡음층. parquet 저장 후 (enriched, noise) 반환."""
+def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """SQL 로드 → enrich → 잡음층 → 침범 탐지. parquet 저장 후 반환."""
     eng = get_engine()
     with eng.connect() as conn:
         df = pd.read_sql(text(_LOAD_SQL), conn)
@@ -83,31 +83,37 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     enriched = logic.enrich_all(df)
     noise = ((enriched["vsi_rssi"] - enriched["vsi_snr"])
              .groupby(enriched["frame"]).median().rename("noise_dbm").reset_index())
+    intrusions = logic.detect_intrusions(enriched)
 
     CACHE_DIR.mkdir(exist_ok=True)
     for old in CACHE_DIR.glob("*.parquet"):      # 이전 키 캐시 정리
         old.unlink(missing_ok=True)
     enriched.to_parquet(CACHE_DIR / f"enriched_{key}.parquet")
     noise.to_parquet(CACHE_DIR / f"noise_{key}.parquet")
-    return enriched, noise
+    intrusions.to_parquet(CACHE_DIR / f"intrusions_{key}.parquet")
+    return enriched, noise, intrusions
 
 
 @st.cache_resource(show_spinner="메시지 분석 데이터 준비 중... (데이터 변경 시에만 오래 걸립니다)")
 def get_bundle() -> dict:
     """전체 프리컴퓨트 번들. 반환 dict 의 DataFrame 은 수정 금지(공유).
 
-    keys: enriched, noise, frames(정렬된 프레임 배열), frame_idx(frame→행위치 ndarray)
+    keys: enriched, noise, intrusions, frames(정렬된 프레임 배열),
+          frame_idx(frame→행위치 ndarray)
     """
     key = _cache_key()
-    ep, np_ = CACHE_DIR / f"enriched_{key}.parquet", CACHE_DIR / f"noise_{key}.parquet"
-    if ep.exists() and np_.exists():
-        enriched, noise = pd.read_parquet(ep), pd.read_parquet(np_)
+    paths = {n: CACHE_DIR / f"{n}_{key}.parquet"
+             for n in ("enriched", "noise", "intrusions")}
+    if all(p.exists() for p in paths.values()):
+        enriched, noise, intrusions = (pd.read_parquet(paths[n])
+                                       for n in ("enriched", "noise", "intrusions"))
     else:
-        enriched, noise = _precompute(key)
+        enriched, noise, intrusions = _precompute(key)
 
     frame_idx = enriched.groupby("frame").indices          # {Timestamp: ndarray}
     frames = np.array(sorted(frame_idx.keys()))
-    return dict(enriched=enriched, noise=noise, frames=frames, frame_idx=frame_idx)
+    return dict(enriched=enriched, noise=noise, intrusions=intrusions,
+                frames=frames, frame_idx=frame_idx)
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)

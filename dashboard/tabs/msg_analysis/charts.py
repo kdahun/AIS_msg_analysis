@@ -182,6 +182,14 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
                             line=dict(width=2.5, color="#FFFFFF")),
                 hoverinfo="skip", showlegend=True))
 
+    _apply_slotmap_axes(
+        fig, "슬롯 = 왼쪽 행번호 + 상단 열번호 (예: 행 500 · 열 +7 → 슬롯 507) · "
+             "셀 왼쪽=채널A, 오른쪽=채널B · 드래그로 확대, 슬롯 클릭 시 그 선박 강조")
+    return fig
+
+
+def _apply_slotmap_axes(fig, title, height=680):
+    """50×45 슬롯맵 공통 축(그래프용지 격자 + 행/열 라벨)·레이아웃."""
     _grid = dict(showgrid=True, gridcolor="rgba(255,255,255,0.12)", gridwidth=1,
                  minor=dict(dtick=1, showgrid=True,
                             gridcolor="rgba(255,255,255,0.05)", gridwidth=1))
@@ -198,12 +206,112 @@ def combined_slot_map(frame_df, highlight_mmsi=None):
         ticktext=[f"+{c}" for c in range(0, MAP_COLS, 10)],
         tickfont=dict(size=9), ticks="outside", ticklen=3, **_grid)
     fig.update_layout(
-        template=_TEMPLATE, height=680, margin=dict(t=30, b=6, l=6, r=6),
+        template=_TEMPLATE, height=height, margin=dict(t=30, b=6, l=6, r=6),
         plot_bgcolor="#0E1117", clickmode="event+select",
         legend=dict(orientation="h", y=1.03),
-        title=dict(text="슬롯 = 왼쪽 행번호 + 상단 열번호 (예: 행 500 · 열 +7 → 슬롯 507) · "
-                        "셀 왼쪽=채널A, 오른쪽=채널B · 드래그로 확대, 슬롯 클릭 시 그 선박 강조",
-                   font=dict(size=11), x=0.01, y=0.995))
+        title=dict(text=title, font=dict(size=11), x=0.01, y=0.995))
+
+
+def intrusion_slot_map(frame_df, frame_events, sel_slot=None, sel_channel=None):
+    """침범 전용 슬롯맵: 그 프레임의 일반 수신은 흐린 회색, 침범 슬롯만 강조.
+
+    frame_events: 이 프레임의 침범 이벤트 rows
+      (columns: channel, slot, victim, victim_rssi, intruder, intruder_rssi)
+    sel_slot/sel_channel: 선택된 이벤트 슬롯 → 흰 테두리 강조
+    """
+    fig = go.Figure()
+
+    # 배경: 이 프레임의 모든 수신(흐리게) — 침범이 어디서 일어났는지 맥락
+    if len(frame_df):
+        slot = frame_df["vsi_slot"].astype(int).values
+        offs = np.where(frame_df["channel"].values == "A", -0.22, 0.22)
+        fig.add_trace(go.Scattergl(
+            x=(slot % MAP_COLS) + offs, y=slot // MAP_COLS,
+            mode="markers", name="일반 수신",
+            marker=dict(color="rgba(120,130,150,0.30)", size=8, symbol="square"),
+            hoverinfo="skip"))
+
+    # 침범 슬롯: 빨강 큰 마커, hover 에 피해자↔침범자 RSSI 비교
+    if len(frame_events):
+        slot = frame_events["slot"].astype(int).values
+        offs = np.where(frame_events["channel"].values == "A", -0.22, 0.22)
+        texts = [f"슬롯 {int(r.slot)} · 채널 {r.channel}<br>"
+                 f"침범자 MMSI {r.intruder} ({r.intruder_rssi:.0f} dBm)<br>"
+                 f"← 피해자 MMSI {r.victim} ({r.victim_rssi:.0f} dBm, "
+                 f"직전 프레임 예약)"
+                 for r in frame_events.itertuples()]
+        fig.add_trace(go.Scattergl(
+            x=(slot % MAP_COLS) + offs, y=slot // MAP_COLS,
+            mode="markers", name="침범 슬롯",
+            marker=dict(color=_VIOL_COLOR, size=13, symbol="square",
+                        line=dict(width=1, color="#FFFFFF")),
+            text=texts, hovertemplate="%{text}<extra></extra>"))
+
+    if sel_slot is not None:
+        off = -0.22 if sel_channel == "A" else 0.22
+        fig.add_trace(go.Scattergl(
+            x=[(int(sel_slot) % MAP_COLS) + off], y=[int(sel_slot) // MAP_COLS],
+            mode="markers", name="선택 이벤트",
+            marker=dict(color="rgba(0,0,0,0)", size=22, symbol="square",
+                        line=dict(width=2.5, color="#FFFFFF")),
+            hoverinfo="skip"))
+
+    _apply_slotmap_axes(fig, "이 프레임의 침범 슬롯(빨강) · 회색=일반 수신 · "
+                             "흰 테두리=선택한 이벤트", height=620)
+    return fig
+
+
+def intrusion_rssi_timeline(hist_df, victim, intruder, ev_frame, slot, channel):
+    """한 (채널,슬롯)의 점유 이력에서 침범 순간을 보여주는 RSSI 타임라인.
+
+    hist_df: 그 (채널,슬롯)의 ±수분 수신 rows (columns: vsi_time, mmsi, vsi_rssi,
+             slot_timeout). 피해자=파란 선+점, 침범자=빨간 큰 점, 기타=회색 점.
+    ev_frame: 침범 프레임(Timestamp) → 주황 세로 밴드.
+    """
+    fig = go.Figure()
+    hist_df = hist_df.sort_values("vsi_time")
+
+    others = hist_df[~hist_df["mmsi"].isin([victim, intruder])]
+    if len(others):
+        fig.add_trace(go.Scatter(
+            x=others["vsi_time"], y=others["vsi_rssi"], mode="markers",
+            name="기타 선박", marker=dict(color="#7A8290", size=7),
+            customdata=others["mmsi"],
+            hovertemplate="MMSI %{customdata}<br>%{y:.0f} dBm<extra></extra>"))
+
+    v = hist_df[hist_df["mmsi"] == victim]
+    if len(v):
+        to_txt = ["" if pd.isna(t) else f" · timeout {int(t)}"
+                  for t in v["slot_timeout"]]
+        fig.add_trace(go.Scatter(
+            x=v["vsi_time"], y=v["vsi_rssi"], mode="lines+markers",
+            name=f"피해자 {victim}",
+            line=dict(color="#4D9FEC", width=1.5),
+            marker=dict(color="#4D9FEC", size=10),
+            text=to_txt,
+            hovertemplate=f"피해자 MMSI {victim}<br>%{{y:.0f}} dBm%{{text}}<extra></extra>"))
+
+    g = hist_df[hist_df["mmsi"] == intruder]
+    if len(g):
+        fig.add_trace(go.Scatter(
+            x=g["vsi_time"], y=g["vsi_rssi"], mode="markers",
+            name=f"침범자 {intruder}",
+            marker=dict(color=_VIOL_COLOR, size=16, symbol="diamond",
+                        line=dict(width=1.5, color="#FFFFFF")),
+            hovertemplate=f"침범자 MMSI {intruder}<br>%{{y:.0f}} dBm<extra></extra>"))
+
+    fig.add_vrect(x0=ev_frame, x1=ev_frame + pd.Timedelta(minutes=1),
+                  fillcolor="rgba(242,163,60,0.15)", line_width=0,
+                  annotation_text="침범 프레임", annotation_position="top left",
+                  annotation_font=dict(size=11, color="#F2A33C"))
+
+    fig.update_layout(
+        template=_TEMPLATE, height=380, margin=dict(t=40, b=10, l=10, r=10),
+        plot_bgcolor="#0E1117", legend=dict(orientation="h", y=1.12),
+        title=dict(text=f"채널 {channel} · 슬롯 {slot} 점유 이력 — 피해자(파랑)가 "
+                        "지키던 슬롯에 침범자(빨강 다이아)가 더 강한 신호로 등장",
+                   font=dict(size=12), x=0.01),
+        yaxis_title="RSSI (dBm)", xaxis_title="수신 시각")
     return fig
 
 
