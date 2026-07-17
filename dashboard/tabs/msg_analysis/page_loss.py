@@ -32,7 +32,16 @@ def render():
     noise_map = noise_df.set_index("frame")["noise_dbm"]
 
     # ── 시간 기반 유실 (슬라이더 반영) ────────────────────────
-    lost_rows = df[df["ri_reason"].isin(list(logic.RI_HOLD_CODES))]
+    # 유실 신호 세기 추정: 유실 구간의 양옆(직전 행=이 메시지, 직후 행=같은 선박
+    # 다음 수신)의 RSSI 평균. 선박이 한 주기(10~60초) 사이 거의 안 움직이므로
+    # 유실된 보고의 실제 세기에 대한 타당한 근사가 된다.
+    rssi_next = df.groupby("mmsi")["vsi_rssi"].shift(-1)
+    est_rssi_all = (df["vsi_rssi"] + rssi_next) / 2
+
+    lost_mask = df["ri_reason"].isin(list(logic.RI_HOLD_CODES))
+    lost_rows = df[lost_mask].assign(est_rssi=est_rssi_all[lost_mask])
+    lost_rows = lost_rows.assign(
+        est_margin=lost_rows["est_rssi"] - lost_rows["frame"].map(noise_map))
     n_time = int(lost_rows["ri_missed_count"].sum())
     n_env = int(lost_rows.loc[lost_rows["ri_reason"] == "RI_LOST_NOISE",
                               "ri_missed_count"].sum())
@@ -55,15 +64,27 @@ def render():
 
     st.divider()
 
-    # ── 시간대별 추이 + 잡음층 ────────────────────────────────
+    # ── 시간대별 추이 + 잡음층 + 유실 추정 RSSI ───────────────
     bucket = st.select_slider("추이 구간(분)", options=[5, 10, 20, 30, 60], value=10,
                               key="loss_bucket")
-    per = (lost_rows.set_index("frame")["ri_missed_count"]
-           .resample(f"{bucket}min").sum())
-    st.plotly_chart(charts.loss_timeline(per, noise_df, bucket),
+    li = lost_rows.set_index("frame")
+    per = li["ri_missed_count"].resample(f"{bucket}min").sum()
+    est_q = (li["est_rssi"].resample(f"{bucket}min")
+             .agg(q25=lambda s: s.quantile(.25), q50="median",
+                  q75=lambda s: s.quantile(.75)))
+    st.plotly_chart(charts.loss_timeline(per, noise_df, bucket, est_rssi_q=est_q),
                     use_container_width=True, key="loss_tl")
-    st.caption("잡음층(빨간 점선)이 올라가는 구간에서 유실이 같이 늘면 환경(잡음) 요인, "
-               "잡음층이 낮은데도 유실이 많으면 혼잡/충돌 등 다른 요인을 의심할 수 있습니다.")
+    st.caption(
+        "**유실 신호 추정 RSSI(파란 선)** = 유실 구간 양옆 수신 RSSI 의 보간 — 유실된 보고가 "
+        "어느 세기로 왔을지에 대한 근사입니다. 파란 선이 잡음층(빨간 점선)에 붙는 구간은 "
+        "신호가 잡음에 묻힌 **환경성** 유실, 잡음층보다 한참 위인데 유실이 많으면 "
+        "혼잡/충돌 등 **다른 요인**을 의심할 수 있습니다.")
+
+    # ── 유실 순간 추정 신호여유 분포 ──────────────────────────
+    st.plotly_chart(charts.loss_margin_hist(lost_rows["est_margin"], margin),
+                    use_container_width=True, key="loss_hist")
+    st.caption("유실 '구간'(연속 유실 묶음) 단위 분포입니다. 수신한계 여유 슬라이더를 "
+               "움직이면 한계선이 함께 이동합니다.")
 
     # ── MMSI별 유실 TOP ──────────────────────────────────────
     st.markdown("#### 선박별 유실 현황")
@@ -71,7 +92,8 @@ def render():
     tbl = pd.DataFrame({
         "유실 보고 수": g["ri_missed_count"].sum(),
         "유실 구간 수": g.size(),
-        "평균 RSSI": g["vsi_rssi"].mean().round(0),
+        "유실 추정 RSSI": g["est_rssi"].median().round(0),
+        "추정 여유(dB)": g["est_margin"].median().round(0),
         "평균 거리(km)": g["dist_km"].mean().round(1),
     })
     total_by = df.groupby("mmsi").size()
@@ -80,6 +102,8 @@ def render():
                      / (tbl["유실 보고 수"] + tbl["수신 메시지"]) * 100).round(1)
     tbl = (tbl.reset_index().sort_values("유실 보고 수", ascending=False)
            [["mmsi", "유실 보고 수", "유실 구간 수", "유실률(%)", "수신 메시지",
-             "평균 RSSI", "평균 거리(km)"]])
-    st.caption("유실이 많은 선박 순 — 평균 RSSI·거리가 낮고 멀수록 환경성일 확률이 높습니다")
+             "유실 추정 RSSI", "추정 여유(dB)", "평균 거리(km)"]])
+    st.caption("유실이 많은 선박 순 — **유실 추정 RSSI**(유실 구간 양옆 보간 중앙값)와 "
+               f"**추정 여유**(추정 RSSI−잡음층)가 낮을수록({margin:.0f}dB 미만) 환경성, "
+               "여유가 큰데 유실이 많으면 다른 원인(혼잡/충돌 등)입니다")
     st.dataframe(tbl, use_container_width=True, hide_index=True, height=330)

@@ -337,19 +337,41 @@ def intrusion_rssi_timeline(hist_df, victim, intruder, ev_frame, slot, channel):
     return fig
 
 
-def loss_timeline(loss_per_bucket: pd.Series, noise_df, bucket_min: int):
-    """시간대별 유실 추이(막대) + 잡음층(보조축 선) — 잡음이 오를 때 유실이
-    늘어나는지(환경 요인) 한눈에 비교.
+def loss_timeline(loss_per_bucket: pd.Series, noise_df, bucket_min: int,
+                  est_rssi_q=None):
+    """시간대별 유실 추이(막대) + 잡음층·유실 추정 RSSI(보조축, dBm).
+
+    유실 신호의 추정 RSSI(양옆 수신 보간)가 잡음층에 붙으면 '신호가 잡음에
+    묻혀 유실'(환경성), 잡음층보다 훨씬 위면 신호 세기 문제가 아님을 뜻한다.
 
     loss_per_bucket: index=bucket 시각, value=유실 보고 수
     noise_df: columns=[frame, noise_dbm]
+    est_rssi_q: DataFrame(index=bucket, columns=[q25, q50, q75]) — 유실 추정 RSSI 분위
     """
     from plotly.subplots import make_subplots
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(
         x=loss_per_bucket.index, y=loss_per_bucket.values, name="유실 보고 수",
-        marker_color="#F2A33C", opacity=0.85,
+        marker_color="#F2A33C", opacity=0.75,
         hovertemplate="%{x}<br>유실 %{y}건<extra></extra>"), secondary_y=False)
+
+    # 유실 추정 RSSI: 중앙값 선 + 25~75% 밴드 (dBm 축)
+    if est_rssi_q is not None and len(est_rssi_q):
+        eq = est_rssi_q.dropna(subset=["q50"])
+        fig.add_trace(go.Scatter(
+            x=eq.index, y=eq["q75"], mode="lines", showlegend=False,
+            line=dict(width=0), hoverinfo="skip"), secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=eq.index, y=eq["q25"], mode="lines", name="유실 추정 RSSI 25~75%",
+            line=dict(width=0), fill="tonexty",
+            fillcolor="rgba(77,159,236,0.18)", hoverinfo="skip"), secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=eq.index, y=eq["q50"], mode="lines",
+            name="유실 신호 추정 RSSI(중앙값)",
+            line=dict(color="#4D9FEC", width=1.8),
+            hovertemplate="%{x}<br>유실 추정 RSSI %{y:.0f} dBm<extra></extra>"),
+            secondary_y=True)
+
     if noise_df is not None and len(noise_df):
         nb = (noise_df.set_index("frame")["noise_dbm"]
               .resample(f"{bucket_min}min").median())
@@ -358,13 +380,46 @@ def loss_timeline(loss_per_bucket: pd.Series, noise_df, bucket_min: int):
             line=dict(color="#FF5C5C", width=1.5, dash="dash"),
             hovertemplate="%{x}<br>잡음층 %{y:.0f} dBm<extra></extra>"),
             secondary_y=True)
+
     fig.update_layout(
-        template=_TEMPLATE, height=340, margin=dict(t=30, b=10, l=10, r=10),
-        plot_bgcolor="#0E1117", legend=dict(orientation="h", y=1.12),
-        title=dict(text=f"{bucket_min}분 단위 유실 보고 수 · 빨간 점선=잡음층(dBm, 오른쪽 축)",
+        template=_TEMPLATE, height=360, margin=dict(t=30, b=10, l=10, r=10),
+        plot_bgcolor="#0E1117", legend=dict(orientation="h", y=1.14),
+        title=dict(text=f"{bucket_min}분 단위 유실 보고 수 · 오른쪽 축(dBm): "
+                        "파란 선=유실 신호 추정 RSSI, 빨간 점선=잡음층 — "
+                        "파란 선이 빨간 선에 붙을수록 환경성 유실",
                    font=dict(size=12), x=0.01))
     fig.update_yaxes(title_text="유실 보고 수", secondary_y=False)
-    fig.update_yaxes(title_text="잡음층 (dBm)", secondary_y=True, showgrid=False)
+    fig.update_yaxes(title_text="dBm (추정 RSSI · 잡음층)", secondary_y=True,
+                     showgrid=False)
+    return fig
+
+
+def loss_margin_hist(margins: pd.Series, decode_margin: float):
+    """유실 순간의 추정 신호여유(추정 RSSI − 잡음층) 분포 히스토그램.
+
+    decode_margin 왼쪽(수신한계 미만) = 환경성 유실 — 잡음에 묻혀 못 받은 것.
+    오른쪽으로 멀수록 신호는 충분했는데 유실된 것(혼잡/충돌 등 다른 원인).
+    """
+    m = margins.dropna()
+    env = m[m < decode_margin]
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=m.values, xbins=dict(size=2), name="유실 구간",
+        marker_color="#4D9FEC", opacity=0.85,
+        hovertemplate="여유 %{x} dB<br>%{y}건<extra></extra>"))
+    fig.add_vline(x=decode_margin, line=dict(color="#FF5C5C", width=2, dash="dash"),
+                  annotation_text=f"수신한계 여유 {decode_margin:.0f}dB",
+                  annotation_position="top right",
+                  annotation_font=dict(color="#FF5C5C", size=11))
+    fig.add_vrect(x0=float(m.min()) - 1 if len(m) else -1, x1=decode_margin,
+                  fillcolor="rgba(255,92,92,0.08)", line_width=0)
+    fig.update_layout(
+        template=_TEMPLATE, height=300, margin=dict(t=34, b=10, l=10, r=10),
+        plot_bgcolor="#0E1117", showlegend=False, bargap=0.05,
+        title=dict(text=f"유실 순간 추정 신호여유 분포 — 한계선 왼쪽(붉은 음영) "
+                        f"{len(env):,}건({100*len(env)/max(len(m),1):.0f}%)이 환경성(잡음에 묻힘)",
+                   font=dict(size=12), x=0.01),
+        xaxis_title="추정 신호여유 = 추정 RSSI − 잡음층 (dB)", yaxis_title="유실 구간 수")
     return fig
 
 
