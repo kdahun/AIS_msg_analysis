@@ -28,8 +28,21 @@ def thresholds(expanded: bool = False):
 
 
 def classified_df():
-    """현재 슬라이더 값으로 분류된 전체 DataFrame (공유 객체 — 수정 금지)."""
+    """현재 슬라이더 값으로 분류된 DataFrame + 사이드바 장소 필터 적용.
+
+    판정 자체는 전체 데이터로 미리 끝나 있고, 여기서는 보여줄 범위만 좁힌다.
+    (구간 경계를 넘는 계산을 막는 것은 프리컴퓨트 단계의 segment_id 가 담당한다)
+    """
     g = st.session_state.get("rc_grid", 0.2)
     f = st.session_state.get("rc_fast", 0.5)
     m = st.session_state.get("rc_margin", 10.0)
-    return data.get_classified(g, f, m), m
+    df = data.get_classified(g, f, m)
+    return filter_sites(df), m
+
+
+def filter_sites(df):
+    """사이드바에서 고른 수집 장소로 행을 좁힌다. 선택이 없으면 그대로 돌려준다."""
+    sites = st.session_state.get("global_sites")
+    if not sites or "site_id" not in getattr(df, "columns", []):
+        return df
+    return df[df["site_id"].isin([int(s) for s in sites])]

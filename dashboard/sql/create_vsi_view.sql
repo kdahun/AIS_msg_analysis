@@ -1,4 +1,9 @@
+-- 타입별 테이블 20개를 하나로 묶은 조회용 뷰.
+-- site_id 는 원문(ais_messages)에만 있으므로 union 을 감싸고 한 번만 조인한다.
+-- 컬럼 순서는 기존 그대로 두고 site_id 만 맨 뒤에 붙인다(CREATE OR REPLACE 제약).
 CREATE OR REPLACE VIEW v_vsi AS
+SELECT u.*, m.site_id
+FROM (
   SELECT source_id, recv_time, mmsi, 1 AS msg_type, vsi_rssi, vsi_snr, vsi_hour, vsi_minute, vsi_second, vsi_slot FROM ais_msg_1
   UNION ALL
   SELECT source_id, recv_time, mmsi, 3 AS msg_type, vsi_rssi, vsi_snr, vsi_hour, vsi_minute, vsi_second, vsi_slot FROM ais_msg_3
@@ -37,4 +42,6 @@ CREATE OR REPLACE VIEW v_vsi AS
   UNION ALL
   SELECT source_id, recv_time, mmsi, 24 AS msg_type, vsi_rssi, vsi_snr, vsi_hour, vsi_minute, vsi_second, vsi_slot FROM ais_msg_24a
   UNION ALL
-  SELECT source_id, recv_time, mmsi, 24 AS msg_type, vsi_rssi, vsi_snr, vsi_hour, vsi_minute, vsi_second, vsi_slot FROM ais_msg_24b;
+  SELECT source_id, recv_time, mmsi, 24 AS msg_type, vsi_rssi, vsi_snr, vsi_hour, vsi_minute, vsi_second, vsi_slot FROM ais_msg_24b
+) u
+JOIN ais_messages m ON m.id = u.source_id;

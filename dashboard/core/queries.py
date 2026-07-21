@@ -9,24 +9,58 @@ from core.db import run_query
 from core.constants import VIEW, RAW_TABLE, RX_LAT, RX_LON, UNIV_START
 
 
+# ── 장소 필터 (사이드바 전역 선택) ────────────────────────────
+# 두 장소는 수신국 위치·전파환경이 달라 RSSI 절대값을 직접 비교할 수 없다.
+# 선택이 없으면 전체를 본다.
+def get_site_options() -> pd.DataFrame:
+    """수집 장소 목록 + 각 장소의 수신 건수. columns=[site_id, code, name, n]"""
+    return run_query(
+        f"""SELECT s.id AS site_id, s.code, s.name, count(v.source_id) AS n
+              FROM rx_sites s LEFT JOIN {VIEW} v ON v.site_id = s.id
+             GROUP BY 1, 2, 3 ORDER BY 1""")
+
+
+def selected_sites() -> list[int] | None:
+    """사이드바에서 고른 장소 id 목록. 선택이 없으면 None(전체)."""
+    try:
+        import streamlit as st
+        picked = st.session_state.get("global_sites")
+    except Exception:
+        picked = None
+    return [int(x) for x in picked] if picked else None
+
+
+def _view(alias: str = "") -> str:
+    """FROM 절에 넣을 뷰 표현식. 장소가 선택돼 있으면 그 장소로 좁힌 서브쿼리를 준다.
+
+    site id 는 DB 에서 온 정수만 들어오므로 문자열로 이어 붙여도 안전하다.
+    (run_query 가 (sql, params) 단위로 캐싱하므로 값이 SQL 에 있어야 캐시가 갈린다)
+    """
+    sites = selected_sites()
+    if not sites:
+        return f"{VIEW} {alias}".strip()
+    ids = ",".join(str(s) for s in sites)
+    return f"(SELECT * FROM {VIEW} WHERE site_id IN ({ids})) {alias or VIEW}"
+
+
 # ── 공통 조회 ────────────────────────────────────────────────
 def get_time_bounds(mmsis: list[int] | None = None):
     """최소/최대 수신시각. mmsis 를 주면 그 MMSI(들)로 한정된 범위를 반환한다."""
     if mmsis:
         df = run_query(
-            f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {VIEW} "
+            f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {_view()} "
             f"WHERE mmsi = ANY(:mmsis)",
             {"mmsis": list(mmsis)},
         )
     else:
-        df = run_query(f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {VIEW}")
+        df = run_query(f"SELECT MIN(recv_time) AS lo, MAX(recv_time) AS hi FROM {_view()}")
     return df.iloc[0]["lo"], df.iloc[0]["hi"]
 
 
 def get_mmsi_options(limit: int = 2000) -> pd.DataFrame:
     """수신 건수 많은 순으로 MMSI 목록. columns=[mmsi, n]"""
     return run_query(
-        f"SELECT mmsi, COUNT(*) AS n FROM {VIEW} "
+        f"SELECT mmsi, COUNT(*) AS n FROM {_view()} "
         f"GROUP BY mmsi ORDER BY n DESC LIMIT :lim",
         {"lim": limit},
     )
@@ -35,7 +69,7 @@ def get_mmsi_options(limit: int = 2000) -> pd.DataFrame:
 def get_msg_type_counts() -> pd.DataFrame:
     """메시지 타입별 건수. columns=[msg_type, n]"""
     return run_query(
-        f"SELECT msg_type, COUNT(*) AS n FROM {VIEW} "
+        f"SELECT msg_type, COUNT(*) AS n FROM {_view()} "
         f"GROUP BY msg_type ORDER BY msg_type"
     )
 
@@ -57,7 +91,7 @@ def stats_by_mmsi(mmsis: list[int]) -> pd.DataFrame:
                MIN(vsi_snr)                   AS snr_min,
                MAX(vsi_snr)                   AS snr_max,
                ROUND(STDDEV(vsi_snr)::numeric, 2)  AS snr_std
-        FROM {VIEW}
+        FROM {_view()}
         WHERE mmsi = ANY(:mmsis)
         GROUP BY mmsi ORDER BY mmsi
         """,
@@ -75,7 +109,7 @@ def dist_by_mmsi(mmsis: list[int], metric: str) -> pd.DataFrame:
     return run_query(
         f"""
         SELECT mmsi, {metric} AS value, COUNT(*) AS n
-        FROM {VIEW}
+        FROM {_view()}
         WHERE mmsi = ANY(:mmsis)
         GROUP BY mmsi, {metric} ORDER BY mmsi, value
         """,
@@ -112,7 +146,7 @@ def timeseries(bucket: str, start, end,
                COUNT(*)                        AS n,
                ROUND(AVG(vsi_rssi)::numeric, 2) AS rssi_avg,
                ROUND(AVG(vsi_snr)::numeric, 2)  AS snr_avg
-        FROM {VIEW}
+        FROM {_view()}
         WHERE {where_sql}
         GROUP BY 1 ORDER BY 1
         """,
@@ -124,7 +158,7 @@ def count_points(start, end, mmsis: list[int] | None = None,
                  msg_types: list[int] | None = None) -> int:
     """조건에 맞는 개별 메시지(행) 총 건수."""
     where_sql, params = _vsi_where(start, end, mmsis, msg_types)
-    df = run_query(f"SELECT COUNT(*) AS n FROM {VIEW} WHERE {where_sql}", params)
+    df = run_query(f"SELECT COUNT(*) AS n FROM {_view()} WHERE {where_sql}", params)
     return int(df.iloc[0]["n"])
 
 
@@ -163,7 +197,7 @@ def points(start, end, mmsis: list[int] | None = None,
             f"""
             SELECT {_VSI_TIME_EXPR} AS vsi_time,
                    recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
-            FROM {VIEW}
+            FROM {_view()}
             WHERE {where_sql}
             ORDER BY vsi_time
             """,
@@ -179,7 +213,7 @@ def points(start, end, mmsis: list[int] | None = None,
         WITH base AS (
             SELECT {_VSI_TIME_EXPR} AS vsi_time,
                    recv_time, mmsi, msg_type, vsi_rssi, vsi_snr
-            FROM {VIEW}
+            FROM {_view()}
             WHERE {where_sql}
         )
         SELECT vsi_time, recv_time, mmsi, msg_type, vsi_rssi, vsi_snr FROM (
@@ -210,7 +244,7 @@ def stats_by_msg_type() -> pd.DataFrame:
                percentile_cont(0.25) WITHIN GROUP (ORDER BY vsi_snr) AS snr_q1,
                percentile_cont(0.50) WITHIN GROUP (ORDER BY vsi_snr) AS snr_med,
                percentile_cont(0.75) WITHIN GROUP (ORDER BY vsi_snr) AS snr_q3
-        FROM {VIEW}
+        FROM {_view()}
         GROUP BY msg_type ORDER BY msg_type
         """
     )
@@ -220,7 +254,7 @@ def count_messages(msg_types: list[int] | None, mmsis: list[int] | None,
                    start, end) -> int:
     """탐색기 필터 조건에 맞는 전체 건수(페이지네이션용)."""
     where, params = _explorer_where(msg_types, mmsis, start, end)
-    df = run_query(f"SELECT COUNT(*) AS n FROM {VIEW} v WHERE {where}", params)
+    df = run_query(f"SELECT COUNT(*) AS n FROM {_view('v')} WHERE {where}", params)
     return int(df.iloc[0]["n"])
 
 
@@ -237,7 +271,7 @@ def list_messages(msg_types: list[int] | None, mmsis: list[int] | None,
         SELECT v.source_id, v.recv_time, v.mmsi, v.msg_type,
                v.vsi_rssi, v.vsi_snr,
                v.vsi_hour, v.vsi_minute, v.vsi_second {raw_cols}
-        FROM {VIEW} v {join}
+        FROM {_view('v')} {join}
         WHERE {where}
         ORDER BY v.recv_time
         LIMIT :lim OFFSET :off
