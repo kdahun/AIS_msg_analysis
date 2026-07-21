@@ -110,3 +110,69 @@ def render():
                f"**추정 여유**(추정 RSSI−잡음층)가 낮을수록({margin:.0f}dB 미만) 환경성, "
                "여유가 큰데 유실이 많으면 다른 원인(혼잡/충돌 등)입니다")
     st.dataframe(tbl, use_container_width=True, hide_index=True, height=330)
+
+    # ── 프레임별 수신 슬롯 대조 (FSR) ─────────────────────────
+    _render_frame_slots(data.get_bundle()["frameslots"])
+
+
+def _render_frame_slots(fs: pd.DataFrame):
+    """수신기가 받았다는 슬롯 수(FSR)와 우리 로그에 남은 슬롯 수를 프레임별로 대조.
+
+    여기서 세는 '못 받은 슬롯'은 전파상 유실이 아니다. FSR 의 rx_slots 는 장비가
+    이미 디코딩에 성공한 슬롯이라, 우리 로그에 없다는 건 장비 출력과 파일 기록
+    사이에서 빠졌다는 뜻이다. 그래서 유실량이 아니라 **로그 무결성 지표**로 읽는다.
+    """
+    st.divider()
+    st.markdown("#### 프레임별 수신 슬롯 대조 (수신기 FSR vs 우리 로그)")
+    st.caption(
+        "수신기는 1분마다 '이 프레임에서 슬롯 몇 개가 찼다'(**rx_slots**)를 알려줍니다. "
+        "이 값을 우리가 실제로 기록한 슬롯 수와 비교합니다. **rx_slots 는 이미 디코딩에 "
+        "성공한 슬롯**이므로, 차이는 전파상 유실이 아니라 장비 출력과 파일 기록 사이의 "
+        "손실입니다. 진짜 유실은 옆의 **CRC 실패**(신호는 검출됐으나 디코딩 실패)와 "
+        "아예 검출되지 않은 것입니다.<br>"
+        "슬롯 수는 메시지 건수와 다릅니다 — Type 5 같은 2파트 메시지는 슬롯을 2개 "
+        "차지하므로, 메시지 건수가 아니라 **VDM 파트 수**를 셉니다.",
+        unsafe_allow_html=True)
+
+    norm = fs[(fs["status"] == "") & fs["missing_slots"].notna()]
+    if norm.empty:
+        st.info("비교할 수 있는 프레임이 없습니다.")
+        return
+
+    exact = int((norm["missing_slots"] == 0).sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("비교 가능한 프레임", f"{len(norm):,}",
+              help="구간 시작·종료 프레임과 FSR 이 없는 프레임은 제외했습니다")
+    c2.metric("하나도 안 놓친 프레임", f"{exact:,} ({100*exact/len(norm):.0f}%)")
+    c3.metric("프레임당 못 받은 슬롯", f"{norm['missing_slots'].median():.0f}개",
+              help="1분에 400개 남짓 들어오는 중 몇 개가 우리 로그에 없는지")
+    c4.metric("CRC 실패 (진짜 유실)", f"{int(norm['crc_fail'].sum()):,}",
+              help="신호는 검출됐으나 디코딩에 실패한 건수 — 충돌이나 잡음")
+
+    # 구간별 프레임 수 — '보통 1~2개' 같은 감을 잡는 용도
+    bins = [-10**6, -1, 0, 2, 5, 10, 10**6]
+    names = ["우리가 더 받음", "0개 (안 놓침)", "1~2개", "3~5개", "6~10개", "11개 이상"]
+    cut = pd.cut(norm["missing_slots"], bins=bins, labels=names)
+    dist = (cut.value_counts().reindex(names).rename_axis("못 받은 슬롯")
+            .reset_index(name="프레임 수"))
+    dist["비율(%)"] = (dist["프레임 수"] / len(norm) * 100).round(1)
+    st.dataframe(dist, use_container_width=True, hide_index=True)
+
+    # ── 프레임 목록 ──────────────────────────────────────────
+    only_bad = st.checkbox("많이 빠진 프레임만 보기 (6개 이상)", value=False,
+                           key="loss_fs_only_bad")
+    view = fs if not only_bad else fs[fs["missing_slots"] >= 6]
+    show = view.rename(columns={
+        "frame": "프레임", "channel": "채널", "rx_slots": "FSR 슬롯수",
+        "used_slots": "우리 로그", "missing_slots": "못 받은 슬롯",
+        "msgs": "메시지 수", "crc_fail": "CRC 실패",
+        "strong_slots": "강신호 슬롯", "noise_dbm": "잡음(dBm)", "status": "상태",
+    })[["프레임", "채널", "FSR 슬롯수", "우리 로그", "못 받은 슬롯", "메시지 수",
+        "CRC 실패", "강신호 슬롯", "잡음(dBm)", "상태"]]
+    st.dataframe(show.sort_values("프레임"), use_container_width=True,
+                 hide_index=True, height=360)
+    st.caption(
+        "**강신호 슬롯** = 그 프레임에서 잡음보다 10dB 이상 강하게 검출된 슬롯 수입니다. "
+        "**상태**가 '구간 시작/종료'면 그 1분을 통째로 받지 못해 원래 많이 비어 보이고, "
+        "'FSR 없음'이면 장비가 수신은 하는데 상태 문장만 내지 않은 구간이라 비교할 수 "
+        "없습니다.")

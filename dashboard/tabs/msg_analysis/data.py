@@ -65,6 +65,27 @@ SELECT site_id, trim(channel) AS channel, frame,
 FROM ais_fsr
 """
 
+# 프레임별로 우리가 실제로 받은 슬롯 수. FSR 의 rx_slots 와 대조하기 위한 것이다.
+#
+#  · 단위가 '슬롯' 이므로 메시지 건수가 아니라 **VDM 파트 수**를 세야 한다.
+#    Type 5 처럼 2파트 메시지는 슬롯을 2개 먹는다. 멀티파트는 적재 시 '|' 로
+#    이어 붙여 한 행에 담기므로, 자른 개수가 곧 점유 슬롯 수다.
+#  · Type 1/3 만 보는 _LOAD_SQL 과 달리 **모든 타입**을 세야 rx_slots 와 맞는다.
+#  · 프레임 기준은 _LOAD_SQL 의 vsi_time 과 같은 방식(날짜는 recv_time, 시:분은 VSI).
+_FRAME_SLOTS_SQL = """
+SELECT m.site_id,
+       split_part(m.ais_raw, ',', 5) AS channel,
+       date(m.recv_time - interval '9 hours')
+         + make_interval(hours => v.vsi_hour, mins => v.vsi_minute)
+         + interval '9 hours'                            AS frame,
+       count(*)                                          AS msgs,
+       sum(array_length(string_to_array(m.ais_raw, '|'), 1)) AS used_slots
+FROM v_vsi v
+JOIN ais_messages m ON m.id = v.source_id
+WHERE m.ais_raw IS NOT NULL AND v.vsi_hour IS NOT NULL
+GROUP BY 1, 2, 3
+"""
+
 # 구간(segment) 경계: 전 선박이 이만큼 조용하면 수신이 멈춘 것으로 본다.
 # 근거 — 정상 상태에서 무수신이 2초를 넘은 적이 한 번도 없고(전체 100만 간격 중 0건),
 # 실제 중단은 최소 17초였다. 그 사이가 비어 있어 5초면 양쪽으로 넉넉하다.
@@ -141,6 +162,39 @@ def _build_noise(enriched: pd.DataFrame, fsr: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_frame_slots(slots: pd.DataFrame, fsr: pd.DataFrame,
+                       enriched: pd.DataFrame) -> pd.DataFrame:
+    """프레임별 '장비가 받은 슬롯 수' vs '우리 로그에 남은 슬롯 수'.
+
+    columns=[site_id, channel, frame, msgs, used_slots, rx_slots, missing_slots,
+             crc_fail, strong_slots, noise_dbm, status]
+
+    missing_slots(= rx_slots − used_slots)는 **전파상 유실이 아니다.**
+    rx_slots 는 장비가 이미 디코딩에 성공한 슬롯이므로, 우리 로그에 없다는 건
+    장비 출력과 파일 기록 사이에서 빠졌다는 뜻이다. 로그 무결성 지표로 쓴다.
+    진짜 유실은 crc_fail(검출됐으나 디코딩 실패)과 아예 검출 못한 것이다.
+
+    status 는 그 프레임을 그대로 믿어도 되는지 알려준다.
+      구간 시작/종료 : 그 1분을 통째로 받지 못해 원래 많이 비어 보인다
+      FSR 없음       : 장비가 수신은 하는데 상태 문장만 안 낸 구간(비교 불가)
+      메시지 없음     : 그 분에 수신이 아예 없었다
+    """
+    key = ["site_id", "channel", "frame"]
+    out = slots.merge(fsr[key + ["rx_slots", "crc_fail", "strong_slots", "noise_dbm"]],
+                      on=key, how="outer")
+    out["missing_slots"] = out["rx_slots"] - out["used_slots"]
+
+    # 구간의 첫/마지막 프레임 — 반쪽만 수신되므로 비교에서 빼고 봐야 한다
+    seg = enriched.groupby("segment_id")["frame"]
+    edges = set(seg.min()) | set(seg.max())
+
+    out["status"] = np.select(
+        [out["used_slots"].isna(), out["rx_slots"].isna(), out["frame"].isin(edges)],
+        ["메시지 없음", "FSR 없음", "구간 시작/종료"],
+        default="")
+    return out.sort_values(["frame", "site_id", "channel"]).reset_index(drop=True)
+
+
 def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
     """SQL 로드 → enrich → 잡음층 → 침범 탐지. parquet 저장 후 반환."""
     eng = get_engine()
@@ -148,6 +202,7 @@ def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
         df = pd.read_sql(text(_LOAD_SQL), conn)
         sites = pd.read_sql(text(_SITES_SQL), conn)
         fsr = pd.read_sql(text(_FSR_SQL), conn)
+        slots = pd.read_sql(text(_FRAME_SLOTS_SQL), conn)
     df["vsi_time"] = pd.to_datetime(df["vsi_time"])
     df["frame"] = df["vsi_time"].dt.floor("min")   # 1프레임 = 1분(UTC분 경계와 일치)
 
@@ -164,6 +219,7 @@ def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
 
     enriched = logic.enrich_all(df)
     noise = _build_noise(enriched, fsr)
+    frame_slots = _build_frame_slots(slots, fsr, enriched)
     intrusions = logic.detect_intrusions(enriched)
     losses = logic.build_loss_layer(enriched)
 
@@ -175,10 +231,11 @@ def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
     intrusions.to_parquet(CACHE_DIR / f"intrusions_{key}.parquet")
     losses.to_parquet(CACHE_DIR / f"losses_{key}.parquet")
     fsr.to_parquet(CACHE_DIR / f"fsr_{key}.parquet")
-    return enriched, noise, intrusions, losses, fsr
+    frame_slots.to_parquet(CACHE_DIR / f"frameslots_{key}.parquet")
+    return enriched, noise, intrusions, losses, fsr, frame_slots
 
 
-_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses", "fsr")
+_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses", "fsr", "frameslots")
 
 
 @st.cache_resource(show_spinner="메시지 분석 데이터 준비 중... (데이터 변경 시에만 오래 걸립니다)")
@@ -186,21 +243,22 @@ def get_bundle() -> dict:
     """전체 프리컴퓨트 번들. 반환 dict 의 DataFrame 은 수정 금지(공유).
 
     keys: enriched, noise, intrusions, losses(슬롯 특정 유실 레이어),
-          fsr(수신기 프레임 통계), frames(정렬된 프레임 배열),
-          frame_idx(frame→행위치 ndarray)
+          fsr(수신기 프레임 통계), frameslots(프레임별 수신 슬롯 대조),
+          frames(정렬된 프레임 배열), frame_idx(frame→행위치 ndarray)
     """
     key = _cache_key()
     paths = {n: CACHE_DIR / f"{n}_{key}.parquet" for n in _BUNDLE_PARTS}
     if all(p.exists() for p in paths.values()):
-        enriched, noise, intrusions, losses, fsr = (pd.read_parquet(paths[n])
-                                                    for n in _BUNDLE_PARTS)
+        parts = [pd.read_parquet(paths[n]) for n in _BUNDLE_PARTS]
     else:
-        enriched, noise, intrusions, losses, fsr = _precompute(key)
+        parts = list(_precompute(key))
+    enriched, noise, intrusions, losses, fsr, frameslots = parts
 
     frame_idx = enriched.groupby("frame").indices          # {Timestamp: ndarray}
     frames = np.array(sorted(frame_idx.keys()))
     return dict(enriched=enriched, noise=noise, intrusions=intrusions,
-                losses=losses, fsr=fsr, frames=frames, frame_idx=frame_idx)
+                losses=losses, fsr=fsr, frameslots=frameslots,
+                frames=frames, frame_idx=frame_idx)
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)
