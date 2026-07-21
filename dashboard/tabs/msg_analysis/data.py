@@ -46,14 +46,24 @@ JOIN ais_messages m ON m.id = t.source_id
 ORDER BY t.mmsi, vsi_time
 """
 
+# 데이터가 바뀌면 캐시 키가 달라지도록 하는 지문. ais_fsr 도 잡음층에 쓰이므로 포함한다.
 _FINGERPRINT_SQL = """
-SELECT (SELECT count(*) FROM ais_msg_1) + (SELECT count(*) FROM ais_msg_3) AS n,
+SELECT (SELECT count(*) FROM ais_msg_1) + (SELECT count(*) FROM ais_msg_3)
+         + (SELECT count(*) FROM ais_fsr) AS n,
        greatest((SELECT max(recv_time) FROM ais_msg_1),
                 (SELECT max(recv_time) FROM ais_msg_3)) AS t
 """
 
 # 수집 장소 카탈로그. 거리 계산의 기준점이 장소마다 다르므로 행별로 붙여 쓴다.
 _SITES_SQL = "SELECT id AS site_id, code, name, lat, lon FROM rx_sites ORDER BY id"
+
+# 수신기가 분·채널마다 남긴 프레임 통계($AIFSR).
+# frame 은 생성 컬럼(report_time − 1분)이라 아래 값들이 설명하는 구간과 정확히 맞는다.
+_FSR_SQL = """
+SELECT site_id, trim(channel) AS channel, frame,
+       noise_dbm, rx_slots, crc_fail, strong_slots, ext_res
+FROM ais_fsr
+"""
 
 # 구간(segment) 경계: 전 선박이 이만큼 조용하면 수신이 멈춘 것으로 본다.
 # 근거 — 정상 상태에서 무수신이 2초를 넘은 적이 한 번도 없고(전체 100만 간격 중 0건),
@@ -106,12 +116,38 @@ def _cache_key() -> str:
     return f"v{logic.LOGIC_VERSION}_{n}_{pd.Timestamp(t):%Y%m%d%H%M%S}"
 
 
-def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _build_noise(enriched: pd.DataFrame, fsr: pd.DataFrame) -> pd.DataFrame:
+    """(장소·채널·프레임) 잡음층. FSR 실측을 쓰고, 없는 프레임만 추정으로 메운다.
+
+    columns=[site_id, channel, frame, noise_est, noise_fsr, noise_dbm, noise_src]
+      noise_est  수신 메시지들의 median(RSSI − SNR) — 우리가 계산한 추정치
+      noise_fsr  수신기가 직접 잰 값(ais_fsr.noise_dbm)
+      noise_dbm  판정에 실제로 쓰는 값 = 실측 우선, 없으면 추정
+      noise_src  그 값이 어디서 왔는지("FSR" / "추정")
+
+    추정치는 실측보다 체계적으로 3~4dB 낮게(더 조용하게) 나온다. 수신에 성공한
+    메시지만 가지고 재기 때문이다 — 잡음이 큰 순간의 메시지는 애초에 못 받으므로
+    표본에서 빠지고, 결과적으로 조용한 쪽으로 치우친다. 그대로 두면 신호 여유를
+    그만큼 크게 보게 되어 decode_margin 기준이 관대해진다.
+    """
+    est = ((enriched["vsi_rssi"] - enriched["vsi_snr"])
+           .groupby([enriched["site_id"], enriched["channel"], enriched["frame"]])
+           .median().rename("noise_est").reset_index())
+    key = ["site_id", "channel", "frame"]
+    out = est.merge(fsr[key + ["noise_dbm"]].rename(columns={"noise_dbm": "noise_fsr"}),
+                    on=key, how="left")
+    out["noise_dbm"] = out["noise_fsr"].fillna(out["noise_est"])
+    out["noise_src"] = np.where(out["noise_fsr"].notna(), "FSR", "추정")
+    return out
+
+
+def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
     """SQL 로드 → enrich → 잡음층 → 침범 탐지. parquet 저장 후 반환."""
     eng = get_engine()
     with eng.connect() as conn:
         df = pd.read_sql(text(_LOAD_SQL), conn)
         sites = pd.read_sql(text(_SITES_SQL), conn)
+        fsr = pd.read_sql(text(_FSR_SQL), conn)
     df["vsi_time"] = pd.to_datetime(df["vsi_time"])
     df["frame"] = df["vsi_time"].dt.floor("min")   # 1프레임 = 1분(UTC분 경계와 일치)
 
@@ -127,12 +163,7 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         valid_pos, _haversine_km(rx[0], rx[1], df["lat"], df["lon"]), np.nan)
 
     enriched = logic.enrich_all(df)
-    # 잡음층 추정 = 그 프레임에 수신된 메시지들의 (RSSI − SNR) 중앙값.
-    # 장소·채널까지 나눈다 — 수신국이 다르면 전파환경이 다르고, FSR 실측상
-    # 채널 A 와 B 의 잡음도 서로 다르다. 섞으면 두 값의 중간이 나온다.
-    noise = ((enriched["vsi_rssi"] - enriched["vsi_snr"])
-             .groupby([enriched["site_id"], enriched["channel"], enriched["frame"]])
-             .median().rename("noise_dbm").reset_index())
+    noise = _build_noise(enriched, fsr)
     intrusions = logic.detect_intrusions(enriched)
     losses = logic.build_loss_layer(enriched)
 
@@ -143,10 +174,11 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     noise.to_parquet(CACHE_DIR / f"noise_{key}.parquet")
     intrusions.to_parquet(CACHE_DIR / f"intrusions_{key}.parquet")
     losses.to_parquet(CACHE_DIR / f"losses_{key}.parquet")
-    return enriched, noise, intrusions, losses
+    fsr.to_parquet(CACHE_DIR / f"fsr_{key}.parquet")
+    return enriched, noise, intrusions, losses, fsr
 
 
-_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses")
+_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses", "fsr")
 
 
 @st.cache_resource(show_spinner="메시지 분석 데이터 준비 중... (데이터 변경 시에만 오래 걸립니다)")
@@ -154,20 +186,21 @@ def get_bundle() -> dict:
     """전체 프리컴퓨트 번들. 반환 dict 의 DataFrame 은 수정 금지(공유).
 
     keys: enriched, noise, intrusions, losses(슬롯 특정 유실 레이어),
-          frames(정렬된 프레임 배열), frame_idx(frame→행위치 ndarray)
+          fsr(수신기 프레임 통계), frames(정렬된 프레임 배열),
+          frame_idx(frame→행위치 ndarray)
     """
     key = _cache_key()
     paths = {n: CACHE_DIR / f"{n}_{key}.parquet" for n in _BUNDLE_PARTS}
     if all(p.exists() for p in paths.values()):
-        enriched, noise, intrusions, losses = (pd.read_parquet(paths[n])
-                                               for n in _BUNDLE_PARTS)
+        enriched, noise, intrusions, losses, fsr = (pd.read_parquet(paths[n])
+                                                    for n in _BUNDLE_PARTS)
     else:
-        enriched, noise, intrusions, losses = _precompute(key)
+        enriched, noise, intrusions, losses, fsr = _precompute(key)
 
     frame_idx = enriched.groupby("frame").indices          # {Timestamp: ndarray}
     frames = np.array(sorted(frame_idx.keys()))
     return dict(enriched=enriched, noise=noise, intrusions=intrusions,
-                losses=losses, frames=frames, frame_idx=frame_idx)
+                losses=losses, fsr=fsr, frames=frames, frame_idx=frame_idx)
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)

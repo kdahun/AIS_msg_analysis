@@ -17,7 +17,8 @@ import pandas as pd
 # enrich 결과(디스크 캐시)의 스키마/의미가 바뀔 때마다 올린다 → 캐시 자동 무효화
 #   4: 구간(segment) 도입 — 장소·수집중단을 넘어 시계열을 잇지 않는다.
 #      site_id/segment_id 컬럼 추가, 거리를 장소별 좌표 기준으로 계산.
-LOGIC_VERSION = 4
+#   5: 잡음층을 FSR 실측 우선으로. 추정치는 3~4dB 낮게 치우쳐 있었다.
+LOGIC_VERSION = 5
 
 # sentinel
 HEADING_NA = 511

@@ -423,7 +423,7 @@ def loss_margin_hist(margins: pd.Series, decode_margin: float):
     return fig
 
 
-_METRICS = [("vsi_rssi", "RSSI"), ("vsi_snr", "SNR"), ("dist_km", "거리 (km, 한국해양대 기준)")]
+_METRICS = [("vsi_rssi", "RSSI"), ("vsi_snr", "SNR"), ("dist_km", "거리 (km, 수신 장소 기준)")]
 
 
 def _merged_line(sub_df, col, color, name, showlegend):
@@ -514,4 +514,52 @@ def context_lines_frame(window_df, frame_ts, violator_mmsis, max_legend=12,
     fig.update_layout(template=_TEMPLATE, height=620,
                       margin=dict(t=40, b=0, l=0, r=0),
                       legend=dict(orientation="h", y=1.05))
+    return fig
+
+
+def noise_est_vs_fsr(noise: pd.DataFrame):
+    """잡음층 추정 vs 수신기 실측(FSR) — 위: 시계열, 아래: 차이 분포.
+
+    noise: columns=[site_id, channel, frame, noise_est, noise_fsr, ...]
+           실측이 있는 프레임만 넘긴다.
+    두 선이 붙어 있으면 추정이 잘 맞는 것이고, 추정선이 아래로 벌어질수록
+    잡음을 실제보다 조용하게 봐서 신호 여유를 크게 잡고 있다는 뜻이다.
+    """
+    from plotly.subplots import make_subplots
+    d = noise.sort_values("frame")
+    fig = make_subplots(rows=2, cols=1, row_heights=[0.62, 0.38], vertical_spacing=0.12,
+                        subplot_titles=("프레임별 잡음층 (dBm)",
+                                        "차이 분포 (추정 − 실측, dB)"))
+
+    # 채널별로 선을 나눈다 — A/B 는 서로 다른 잡음 환경이다
+    for ch, color in (("A", "#4C9BE8"), ("B", "#E8A33D")):
+        g = d[d["channel"] == ch]
+        if g.empty:
+            continue
+        fig.add_trace(go.Scatter(x=g["frame"], y=g["noise_fsr"], mode="lines",
+                                 name=f"실측 {ch}", legendgroup=ch,
+                                 line=dict(color=color, width=1.4)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=g["frame"], y=g["noise_est"], mode="lines",
+                                 name=f"추정 {ch}", legendgroup=ch,
+                                 line=dict(color=color, width=1.1, dash="dot"),
+                                 opacity=0.75), row=1, col=1)
+
+    diff = (d["noise_est"] - d["noise_fsr"]).dropna()
+    fig.add_trace(go.Histogram(x=diff, nbinsx=60, name="차이",
+                               marker_color="#7FB069", showlegend=False), row=2, col=1)
+    fig.add_vline(x=0, row=2, col=1, line=dict(color="#AAAAAA", width=1, dash="dash"),
+                  annotation_text="일치", annotation_position="top")
+    if len(diff):
+        fig.add_vline(x=float(diff.mean()), row=2, col=1,
+                      line=dict(color="#FF5C5C", width=2),
+                      annotation_text=f"평균 {diff.mean():+.1f}dB",
+                      annotation_position="top left")
+
+    fig.update_yaxes(title_text="dBm", row=1, col=1)
+    fig.update_xaxes(title_text="추정 − 실측 (dB) · 음수 = 추정이 더 조용",
+                     row=2, col=1)
+    fig.update_yaxes(title_text="프레임 수", row=2, col=1)
+    fig.update_layout(template=_TEMPLATE, height=560,
+                      margin=dict(t=50, b=10, l=10, r=10),
+                      legend=dict(orientation="h", y=1.06))
     return fig

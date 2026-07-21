@@ -128,7 +128,7 @@ def render():
             st.caption(f"이 프레임의 위반 내역 ({len(show)}건, 그중 수신한계 근접 {env_n}건) — "
                       f"잡음여유(RSSI−잡음층)가 {margin:.0f}dB 미만이면 신호가 잡음에 묻혀 "
                       "수신 유실됐을 가능성이 높은 환경성 위반입니다 "
-                      "(거리는 전 구간 한국해양대 좌표 기준, 모텔 구간은 근사값)")
+                      "(거리는 그 메시지를 받은 수집 장소의 좌표 기준)")
         st.dataframe(show, use_container_width=True, hide_index=True)
     elif sel_mmsi is not None:
         st.info(f"MMSI {sel_mmsi} 는 이 프레임에 메시지가 없습니다.")
@@ -155,7 +155,7 @@ def _render_context_lines(df, sel_ts, fdf, noise_df, margin):
         f"위반 선박({len(violators)}척). **빨간 점선=잡음층**, 그 위 음영=수신한계 영역"
         f"(잡음층+{margin:.0f}dB) — 선박 RSSI 선이 이 영역에 들어가면 수신이 물리적으로 "
         "불안정합니다. 거리 패널과 같이 보면 '멀어짐→신호약화→수신유실'을 확인할 수 있습니다. "
-        "선에 마우스를 올리면 MMSI 표시. 거리는 전 구간 한국해양대 좌표 기준."
+        "선에 마우스를 올리면 MMSI 표시. 거리는 그 메시지를 받은 수집 장소 기준."
     )
     st.plotly_chart(
         charts.context_lines_frame(window_df, sel_ts, violators,

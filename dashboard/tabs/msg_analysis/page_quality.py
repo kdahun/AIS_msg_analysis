@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from . import data
+from . import charts, data
 from .logic import SPEED_NA, HEADING_NA, COURSE_NA
 
 TITLE = "데이터 품질"
@@ -19,9 +19,59 @@ TITLE = "데이터 품질"
 RARE_MAX = 10   # 이 미만 수신이면 '희귀 MMSI'
 
 
+def _render_noise_check(noise: pd.DataFrame):
+    """잡음층: 우리가 계산한 추정치와 수신기 실측(FSR)을 나란히 확인한다.
+
+    추정치는 '수신에 성공한 메시지'만 가지고 재기 때문에 조용한 쪽으로 치우친다.
+    잡음이 큰 순간의 메시지는 애초에 못 받아 표본에서 빠지기 때문이다.
+    """
+    st.markdown("#### 잡음층 — 추정 vs 수신기 실측(FSR)")
+    both = noise[noise["noise_fsr"].notna()]
+    if both.empty:
+        st.info("FSR 실측이 있는 프레임이 없습니다. 잡음층은 추정치로만 계산됩니다.")
+        return
+
+    d = both["noise_est"] - both["noise_fsr"]
+    n_fsr = int((noise["noise_src"] == "FSR").sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("실측을 쓴 프레임", f"{n_fsr:,} / {len(noise):,}",
+              help="FSR 이 있으면 실측을 쓰고, 없는 프레임만 추정치로 메웁니다")
+    c2.metric("추정이 더 조용하게 본 프레임", f"{int((d < 0).sum()):,}",
+              help="추정 잡음층이 실측보다 낮게 나온 프레임 수")
+    c3.metric("평균 차이", f"{d.mean():+.1f} dB",
+              help="추정 − 실측. 음수면 추정이 더 조용하다고 본 것")
+    c4.metric("5dB 넘게 낮게 본 프레임", f"{int((d < -5).sum()):,}",
+              help="이 구간은 신호 여유를 5dB 이상 크게 본 셈이 됩니다")
+
+    st.caption(
+        "추정 잡음층이 실측보다 **낮게(조용하게)** 나오는 것이 정상적인 편향입니다. "
+        "추정은 수신에 성공한 메시지의 RSSI−SNR 로 재는데, 잡음이 큰 순간의 메시지는 "
+        "애초에 수신되지 않아 표본에서 빠지기 때문입니다. 이 편향을 그대로 두면 "
+        "신호 여유를 그만큼 크게 보게 되어, 잡음에 묻혀 유실된 보고가 "
+        "'원인 미상'으로 남습니다. 그래서 실측이 있으면 실측을 씁니다."
+    )
+
+    sub = both.copy()
+    sub["차이(dB)"] = d.round(1)
+    tbl = (sub.groupby(["site_id", "channel"])
+              .agg(프레임=("frame", "size"),
+                   추정평균=("noise_est", lambda s: round(s.mean(), 1)),
+                   실측평균=("noise_fsr", lambda s: round(s.mean(), 1)),
+                   평균차이=("차이(dB)", lambda s: round(s.mean(), 1)))
+              .reset_index())
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    fig = charts.noise_est_vs_fsr(both)
+    st.plotly_chart(fig, use_container_width=True, key="quality_noise")
+
+
 def render():
-    st.subheader("데이터 품질 — 기본값(무정보) 장비 · 희귀 MMSI")
-    df = data.get_bundle()["enriched"]
+    st.subheader("데이터 품질 — 잡음층 검증 · 기본값(무정보) 장비 · 희귀 MMSI")
+    b = data.get_bundle()
+    df = b["enriched"]
+
+    _render_noise_check(b["noise"])
+    st.divider()
 
     sentinel = ((~df["lat"].between(-90, 90)) & (~df["lon"].between(-180, 180))
                 & (df["speed"] == SPEED_NA) & (df["heading"] == HEADING_NA)
