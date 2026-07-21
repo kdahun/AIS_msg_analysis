@@ -15,7 +15,9 @@ import numpy as np
 import pandas as pd
 
 # enrich 결과(디스크 캐시)의 스키마/의미가 바뀔 때마다 올린다 → 캐시 자동 무효화
-LOGIC_VERSION = 3
+#   4: 구간(segment) 도입 — 장소·수집중단을 넘어 시계열을 잇지 않는다.
+#      site_id/segment_id 컬럼 추가, 거리를 장소별 좌표 기준으로 계산.
+LOGIC_VERSION = 4
 
 # sentinel
 HEADING_NA = 511
@@ -147,21 +149,32 @@ def enrich_vessel(df: pd.DataFrame) -> pd.DataFrame:
         for s, st, cc in zip(df["speed"], df["status"], df["changing_course"])]
     df["actual_gap"] = df["vsi_time"].shift(-1).sub(df["vsi_time"]).dt.total_seconds()
 
-    # 과소 보고 판별용: 같은 기대주기 상태에서 이 선박이 달성하는 '가장 짧은' 간격
-    # 비율(p10). 수신 유실은 간격을 늘리기만 하므로, p10 이 여전히 크면(≈2배 이상)
-    # 선박이 원래 규정보다 느리게 쏘는 것(과소 보고), 1 근처면 규정 주기를 달성하는 것.
+    # achieved_ratio_floor 는 여기서 내지 않는다 — 선박 단위 통계라서
+    # 구간별로 쪼개면 표본이 부족해져 값이 흔들린다. enrich_all 에서 한 번에 낸다.
+    _enrich_slot_chain(df)
+    return df
+
+
+def _achieved_ratio_floor(df: pd.DataFrame) -> np.ndarray:
+    """같은 기대주기 상태에서 이 선박이 달성하는 '가장 짧은' 간격 비율(p10).
+
+    수신 유실은 간격을 늘리기만 하므로, p10 이 여전히 크면(≈2배 이상) 선박이 원래
+    규정보다 느리게 쏘는 것(과소 보고)이고, 1 근처면 규정 주기를 달성하는 것이다.
+
+    **구간이 아니라 선박 단위로 낸다.** 이 값은 그 선박의 송신 습성이지 우리 수신
+    구간의 성질이 아니다. 구간별로 나누면 표본이 쪼개져 p10 이 흔들리고, 실제로
+    과소 보고 판정이 839건이나 널뛰었다.
+    """
     with np.errstate(invalid="ignore", divide="ignore"):
         r = df["actual_gap"].values / df["expected_interval"].values
+    tmp = pd.DataFrame({"mmsi": df["mmsi"].values,
+                        "exp": df["expected_interval"].values, "r": r})
     floor = np.full(len(df), np.nan)
-    tmp = pd.DataFrame({"exp": df["expected_interval"].values, "r": r})
-    for _, grp in tmp.groupby("exp"):
+    for _, grp in tmp.groupby(["mmsi", "exp"], sort=False):
         rr = grp["r"].dropna()
         if len(rr) >= UNDER_MIN_SAMPLES:
             floor[grp.index.to_numpy()] = np.percentile(rr.values, 10)
-    df["achieved_ratio_floor"] = floor
-
-    _enrich_slot_chain(df)
-    return df
+    return floor
 
 
 def _enrich_slot_chain(df: pd.DataFrame):
@@ -260,8 +273,18 @@ def _enrich_slot_chain(df: pd.DataFrame):
 
 
 def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
-    parts = [enrich_vessel(g) for _, g in df.groupby("mmsi", sort=False)]
-    return pd.concat(parts, ignore_index=True)
+    """선박별 시계열 계산. 반드시 '구간 안에서만' 묶는다.
+
+    segment_id 를 빼고 mmsi 로만 묶으면 장소 이동(123분)이나 장비 중단(최대 145초)을
+    하나의 보고 간격으로 잇게 되어 위반으로 오탐된다(실측 1,369건).
+    구간 마지막 메시지는 '다음 보고 없음'으로 남아 검증 보류가 된다.
+    """
+    parts = [enrich_vessel(g)
+             for _, g in df.groupby(["segment_id", "mmsi"], sort=False)]
+    out = pd.concat(parts, ignore_index=True)
+    # 이건 선박 단위 통계라 구간을 가로질러 한 번에 낸다(위 함수 주석 참고).
+    out["achieved_ratio_floor"] = _achieved_ratio_floor(out)
+    return out
 
 
 # ── 슬롯 특정 유실 (오차/배율 무관 → 프리컴퓨트 대상) ─────────
@@ -275,15 +298,18 @@ def build_loss_layer(df: pd.DataFrame) -> pd.DataFrame:
 
     반환 columns: mmsi, channel, slot, frame, est_rssi(양옆 평균), gap_frames
     """
-    cols = ["mmsi", "channel", "slot", "frame", "est_rssi", "gap_frames"]
+    cols = ["site_id", "mmsi", "channel", "slot", "frame", "est_rssi", "gap_frames"]
     t1 = df[(df["msg_type"] == 1) & df["slot_timeout"].notna()
             & df["channel"].isin(["A", "B"])]
     if t1.empty:
         return pd.DataFrame(columns=cols)
 
-    s = (t1[["mmsi", "channel", "vsi_slot", "frame", "slot_timeout", "vsi_rssi"]]
-         .sort_values(["mmsi", "channel", "vsi_slot", "frame"]))
-    grp = s.groupby(["mmsi", "channel", "vsi_slot"])
+    # segment_id 를 키에 넣어, 장비가 꺼진 구간을 사이에 두고 이어붙이지 않게 한다.
+    # (짧은 중단은 프레임 간격 d 가 2~3 이라 timeout 감소와 우연히 맞을 수 있다)
+    s = (t1[["segment_id", "site_id", "mmsi", "channel", "vsi_slot", "frame",
+             "slot_timeout", "vsi_rssi"]]
+         .sort_values(["segment_id", "mmsi", "channel", "vsi_slot", "frame"]))
+    grp = s.groupby(["segment_id", "mmsi", "channel", "vsi_slot"])
     prev_frame = grp["frame"].shift(1)
     prev_to = grp["slot_timeout"].shift(1)
     prev_rssi = grp["vsi_rssi"].shift(1)
@@ -296,7 +322,7 @@ def build_loss_layer(df: pd.DataFrame) -> pd.DataFrame:
     for r in sub.itertuples(index=False):
         est = np.nanmean([r.p_rssi, r.vsi_rssi])
         for j in range(1, int(r.gap_d)):
-            out.append((r.mmsi, r.channel, int(r.vsi_slot),
+            out.append((r.site_id, r.mmsi, r.channel, int(r.vsi_slot),
                         r.p_frame + pd.Timedelta(minutes=j), est, int(r.gap_d) - 1))
     return pd.DataFrame(out, columns=cols)
 
@@ -317,7 +343,7 @@ def detect_intrusions(df: pd.DataFrame) -> pd.DataFrame:
       victim_rssi, victim_dist, intruder, intruder_rssi, intruder_dist,
       f_returns, victim_rssi_after
     """
-    cols = ["channel", "slot", "frame", "victim", "victim_timeout_prev",
+    cols = ["site_id", "channel", "slot", "frame", "victim", "victim_timeout_prev",
             "victim_rssi", "victim_dist", "intruder", "intruder_rssi",
             "intruder_dist", "f_returns", "victim_rssi_after"]
     t1 = df[(df["msg_type"] == 1) & df["slot_timeout"].notna()
@@ -326,6 +352,7 @@ def detect_intrusions(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     occ = pd.DataFrame({
+        "site_id": t1["site_id"].values,
         "channel": t1["channel"].values, "slot": t1["vsi_slot"].astype(int).values,
         "frame": t1["frame"].values, "mmsi": t1["mmsi"].values,
         "timeout": t1["slot_timeout"].astype(int).values,
@@ -335,17 +362,19 @@ def detect_intrusions(df: pd.DataFrame) -> pd.DataFrame:
     res = occ[occ["timeout"] >= 1].copy()
     res["frame"] = res["frame"] + pd.Timedelta(minutes=1)
     res = (res.sort_values("rssi", ascending=False)
-              .drop_duplicates(["channel", "slot", "frame"])
+              .drop_duplicates(["site_id", "channel", "slot", "frame"])
               .rename(columns={"mmsi": "victim", "timeout": "victim_timeout_prev",
                                "rssi": "victim_rssi", "dist": "victim_dist"}))
 
-    # 이번 프레임 점유자에 예약자 정보를 붙임
-    m = occ.merge(res, on=["channel", "slot", "frame"], how="inner")
+    # 이번 프레임 점유자에 예약자 정보를 붙임.
+    # site_id 를 키에 넣는 이유: 두 장소에서 동시에 수집하면 서로 다른 수신국이
+    # 같은 (채널,슬롯,프레임)을 보게 되고, 무관한 선박끼리 침범으로 오탐된다.
+    m = occ.merge(res, on=["site_id", "channel", "slot", "frame"], how="inner")
     if m.empty:
         return pd.DataFrame(columns=cols)
 
-    # 그 (채널,슬롯,프레임)에 피해자 본인이 있으면 침범 아님(정상 반복)
-    key = ["channel", "slot", "frame"]
+    # 그 (장소,채널,슬롯,프레임)에 피해자 본인이 있으면 침범 아님(정상 반복)
+    key = ["site_id", "channel", "slot", "frame"]
     victim_present = (m[m["mmsi"] == m["victim"]][key].drop_duplicates()
                       .assign(_vp=True))
     m = m.merge(victim_present, on=key, how="left")
@@ -359,7 +388,7 @@ def detect_intrusions(df: pd.DataFrame) -> pd.DataFrame:
                                "dist": "intruder_dist"}))
 
     # 브라킷: 피해자가 다음 프레임에 그 슬롯으로 복귀했는가 (+복귀 RSSI)
-    nxt = occ[["channel", "slot", "frame", "mmsi", "rssi"]].copy()
+    nxt = occ[["site_id", "channel", "slot", "frame", "mmsi", "rssi"]].copy()
     nxt["frame"] = nxt["frame"] - pd.Timedelta(minutes=1)
     nxt = (nxt.rename(columns={"mmsi": "victim", "rssi": "victim_rssi_after"})
               .sort_values("victim_rssi_after", ascending=False)
@@ -381,9 +410,13 @@ def _signal_margin(df: pd.DataFrame, noise_df, offset_min: int = 0) -> np.ndarra
     n = len(df)
     if noise_df is None or not len(noise_df):
         return np.full(n, np.nan)
-    noise_by_frame = noise_df.set_index("frame")["noise_dbm"]
-    tgt = df["frame"] + pd.Timedelta(minutes=offset_min)
-    noise = tgt.map(noise_by_frame).values
+    # 같은 (장소, 채널, 프레임)의 잡음층을 찾는다. 채널까지 맞추는 이유는
+    # A/B 의 잡음이 서로 다르기 때문이다(FSR 실측 기준 수 dB 차이).
+    idx = noise_df.set_index(["site_id", "channel", "frame"])["noise_dbm"]
+    keys = pd.MultiIndex.from_arrays([
+        df["site_id"].values, df["channel"].values,
+        (df["frame"] + pd.Timedelta(minutes=offset_min)).values])
+    noise = idx.reindex(keys).values
     return df["vsi_rssi"].values - noise
 
 

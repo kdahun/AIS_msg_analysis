@@ -29,7 +29,9 @@ def render():
     df, margin = controls.classified_df()
     b = data.get_bundle()
     noise_df, losses = b["noise"], b["losses"]
-    noise_map = noise_df.set_index("frame")["noise_dbm"]
+    # 잡음층은 (장소·채널·프레임) 단위라 프레임당 여러 행이다.
+    # 여기서는 프레임 하나에 값 하나가 필요하므로 표시용으로 줄여 쓴다.
+    noise_map = data.noise_frame_series(noise_df)
 
     # ── 시간 기반 유실 (슬라이더 반영) ────────────────────────
     # 유실 신호 세기 추정: 유실 구간의 양옆(직전 행=이 메시지, 직후 행=같은 선박
@@ -72,7 +74,8 @@ def render():
     est_q = (li["est_rssi"].resample(f"{bucket}min")
              .agg(q25=lambda s: s.quantile(.25), q50="median",
                   q75=lambda s: s.quantile(.75)))
-    st.plotly_chart(charts.loss_timeline(per, noise_df, bucket, est_rssi_q=est_q),
+    st.plotly_chart(charts.loss_timeline(per, data.noise_frame_df(noise_df), bucket,
+                                         est_rssi_q=est_q),
                     use_container_width=True, key="loss_tl")
     st.caption(
         "**유실 신호 추정 RSSI(파란 선)** = 유실 구간 양옆 수신 RSSI 의 보간 — 유실된 보고가 "

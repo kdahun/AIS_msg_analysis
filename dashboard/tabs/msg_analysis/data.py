@@ -17,7 +17,6 @@ import streamlit as st
 from sqlalchemy import text
 
 from core.db import get_engine
-from core.constants import RX_LAT, RX_LON
 from . import logic
 
 CACHE_DIR = Path(__file__).resolve().parents[2] / "data_cache"
@@ -30,6 +29,7 @@ SELECT t.mmsi, t.msg_type,
          + interval '9 hours', t.recv_time) AS vsi_time,
        t.vsi_slot, t.slot_timeout, t.sub_message, t.speed, t.status, t.heading, t.course,
        t.vsi_rssi, t.vsi_snr, t.lon, t.lat,
+       m.site_id,
        split_part(m.ais_raw, ',', 5) AS channel
 FROM (
   SELECT source_id, mmsi, 1 AS msg_type, recv_time, vsi_hour, vsi_minute, vsi_second,
@@ -52,14 +52,51 @@ SELECT (SELECT count(*) FROM ais_msg_1) + (SELECT count(*) FROM ais_msg_3) AS n,
                 (SELECT max(recv_time) FROM ais_msg_3)) AS t
 """
 
+# 수집 장소 카탈로그. 거리 계산의 기준점이 장소마다 다르므로 행별로 붙여 쓴다.
+_SITES_SQL = "SELECT id AS site_id, code, name, lat, lon FROM rx_sites ORDER BY id"
 
-def _haversine_km(lat, lon):
-    """수신국(RX_LAT/RX_LON = 한국해양대) 기준 거리(km)."""
+# 구간(segment) 경계: 전 선박이 이만큼 조용하면 수신이 멈춘 것으로 본다.
+# 근거 — 정상 상태에서 무수신이 2초를 넘은 적이 한 번도 없고(전체 100만 간격 중 0건),
+# 실제 중단은 최소 17초였다. 그 사이가 비어 있어 5초면 양쪽으로 넉넉하다.
+SEGMENT_GAP_SEC = 5.0
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """두 좌표 사이 거리(km). 배열을 받아 벡터 연산한다."""
     R = 6371.0
-    lat1, lon1, lat2, lon2 = map(np.radians, [RX_LAT, RX_LON, lat, lon])
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
     return R * 2 * np.arcsin(np.sqrt(a))
+
+
+def assign_segments(df: pd.DataFrame, gap_sec: float = SEGMENT_GAP_SEC) -> pd.Series:
+    """'연속 수신 구간' 번호를 매긴다. 시계열 계산을 끊는 단위다.
+
+    새 구간이 시작되는 조건
+      · 수집 장소가 바뀜        → 이동 중 간격은 선박 잘못이 아니다
+      · 전 선박 무수신 gap_sec 이상 → 장비가 꺼진 구간
+
+    보고 간격·슬롯 체인을 이 경계 너머로 이으면 위반으로 오탐된다.
+    날짜는 경계로 쓰지 않는다 — 자정에는 아무 일도 일어나지 않으므로,
+    거기서 끊으면 자정을 넘는 정상 간격까지 버리게 된다.
+    """
+    d = df[["site_id", "vsi_time"]].sort_values("vsi_time", kind="mergesort")
+    new = ((d["site_id"] != d["site_id"].shift(1))
+           | (d["vsi_time"].diff().dt.total_seconds() >= gap_sec))
+    new.iloc[0] = True
+    return new.cumsum().astype("int32")      # 인덱스가 같아 원래 행 순서로 정렬된다
+
+
+def segment_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """구간별 시작·끝·메시지수. 화면 표시와 검증에 쓴다."""
+    g = df.groupby("segment_id")
+    return pd.DataFrame({
+        "site_id": g["site_id"].first(),
+        "start": g["vsi_time"].min(),
+        "end": g["vsi_time"].max(),
+        "n_msg": g.size(),
+    }).reset_index()
 
 
 def _cache_key() -> str:
@@ -74,15 +111,28 @@ def _precompute(key: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eng = get_engine()
     with eng.connect() as conn:
         df = pd.read_sql(text(_LOAD_SQL), conn)
+        sites = pd.read_sql(text(_SITES_SQL), conn)
     df["vsi_time"] = pd.to_datetime(df["vsi_time"])
     df["frame"] = df["vsi_time"].dt.floor("min")   # 1프레임 = 1분(UTC분 경계와 일치)
 
-    valid_pos = (df["lon"].between(-180, 180)) & (df["lat"].between(-90, 90))
-    df["dist_km"] = np.where(valid_pos, _haversine_km(df["lat"], df["lon"]), np.nan)
+    # 연속 수신 구간 — 아래 enrich/침범/유실이 이 경계를 넘지 않도록 한다.
+    df["segment_id"] = assign_segments(df)
+
+    # 거리는 그 메시지를 받은 장소의 좌표 기준이다. 장소마다 다르므로 행별로 붙인다.
+    rx = df["site_id"].map(sites.set_index("site_id")["lat"]), \
+         df["site_id"].map(sites.set_index("site_id")["lon"])
+    valid_pos = (df["lon"].between(-180, 180) & df["lat"].between(-90, 90)
+                 & rx[0].notna())
+    df["dist_km"] = np.where(
+        valid_pos, _haversine_km(rx[0], rx[1], df["lat"], df["lon"]), np.nan)
 
     enriched = logic.enrich_all(df)
+    # 잡음층 추정 = 그 프레임에 수신된 메시지들의 (RSSI − SNR) 중앙값.
+    # 장소·채널까지 나눈다 — 수신국이 다르면 전파환경이 다르고, FSR 실측상
+    # 채널 A 와 B 의 잡음도 서로 다르다. 섞으면 두 값의 중간이 나온다.
     noise = ((enriched["vsi_rssi"] - enriched["vsi_snr"])
-             .groupby(enriched["frame"]).median().rename("noise_dbm").reset_index())
+             .groupby([enriched["site_id"], enriched["channel"], enriched["frame"]])
+             .median().rename("noise_dbm").reset_index())
     intrusions = logic.detect_intrusions(enriched)
     losses = logic.build_loss_layer(enriched)
 
@@ -129,8 +179,25 @@ def get_classified(grid_tol: float, fast_factor: float, decode_margin: float) ->
 
 
 def get_noise_floor() -> pd.DataFrame:
-    """분(프레임) 단위 잡음층 시계열. columns=[frame, noise_dbm]"""
+    """잡음층 시계열. columns=[site_id, channel, frame, noise_dbm]
+
+    판정(classify)은 이 정밀한 값을 그대로 쓴다. 화면에 선 하나로 그릴 때는
+    아래 noise_frame_* 로 프레임 단위 하나로 줄여서 쓴다.
+    """
     return get_bundle()["noise"]
+
+
+def noise_frame_series(noise_df: pd.DataFrame) -> pd.Series:
+    """표시용 — 프레임 하나당 잡음층 하나(장소·채널을 가로질러 중앙값).
+
+    frame 을 인덱스로 하는 Series 라 .map()/.get() 으로 바로 쓸 수 있다.
+    """
+    return noise_df.groupby("frame")["noise_dbm"].median()
+
+
+def noise_frame_df(noise_df: pd.DataFrame) -> pd.DataFrame:
+    """표시용 — columns=[frame, noise_dbm]. 차트 함수들이 기대하는 모양."""
+    return noise_frame_series(noise_df).reset_index()
 
 
 def frame_slice(df: pd.DataFrame, frame) -> pd.DataFrame:

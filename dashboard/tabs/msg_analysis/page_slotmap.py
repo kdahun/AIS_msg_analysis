@@ -15,7 +15,9 @@ def render():
     st.subheader("프레임 슬롯맵 (채널 A/B 통합 · 2,250슬롯/1분)")
     controls.thresholds()
     df, margin = controls.classified_df()
-    noise_df = data.get_noise_floor()
+    # 잡음층은 (장소·채널·프레임) 단위. 이 페이지는 프레임 하나를 통째로 보여주므로
+    # 표시용(프레임당 값 하나)으로 줄여서 쓴다.
+    noise_df = data.noise_frame_df(data.get_noise_floor())
 
     frames = data.get_bundle()["frames"]
     n = len(frames)
