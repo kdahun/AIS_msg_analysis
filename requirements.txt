@@ -13,7 +13,7 @@ pyais
 # PostgreSQL
 psycopg2-binary
 
-# 수집 장소 카탈로그 (AIS_실해역_데이터/sites.yaml)
+# Site catalog (sites.yaml)
 PyYAML
 
 # Visualization

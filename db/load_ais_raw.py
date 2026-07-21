@@ -31,84 +31,7 @@ from psycopg2.extras import execute_values
 
 import parse_by_type as P
 import rx_sites as S
-
-CREATE_TABLE = f"""
-CREATE TABLE IF NOT EXISTS {S.RAW_TABLE} (
-    id        BIGSERIAL PRIMARY KEY,
-    recv_time TIMESTAMP(6),
-    msg_type  SMALLINT,
-    ais_raw   TEXT,
-    vsi_raw   TEXT,
-    site_id   SMALLINT NOT NULL REFERENCES rx_sites(id),
-    src_file  TEXT NOT NULL,
-    CONSTRAINT chk_not_both_null CHECK (ais_raw IS NOT NULL OR vsi_raw IS NOT NULL)
-);
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_recv_time ON {S.RAW_TABLE} (recv_time);
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_msg_type  ON {S.RAW_TABLE} (msg_type);
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_site_time ON {S.RAW_TABLE} (site_id, recv_time);
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_src_file  ON {S.RAW_TABLE} (src_file);
-"""
-
-INSERT = (f"INSERT INTO {S.RAW_TABLE} "
-          f"(recv_time, msg_type, ais_raw, vsi_raw, site_id, src_file) VALUES %s")
-
-# $AIFSR — 선박 메시지가 아니라 '수신기 자신의 프레임 통계'라 별도 테이블에 둔다.
-# ais_messages 에 섞으면 CHECK 제약에 걸리고 '총 메시지 수' 류의 집계가 전부 오염된다.
-#
-# 시각 규칙 (분석 시 반드시 이해할 것)
-#   report_time : 문장이 조립된 시각 = '지금 시작하는' 프레임의 시작점
-#   frame       : report_time - 1분. 아래 '이전 프레임' 값들이 설명하는 구간이며
-#                 대시보드의 frame(vsi_time 을 분으로 내림) 과 같은 값이다.
-#                 → 메시지와의 조인은 항상 frame 으로 한다.
-# 두 시각 모두 KST(naive). ais_messages.recv_time 과 축을 맞춘다(원문은 UTC).
-CREATE_FSR = """
-CREATE TABLE IF NOT EXISTS ais_fsr (
-    id           BIGSERIAL PRIMARY KEY,
-    site_id      SMALLINT NOT NULL REFERENCES rx_sites(id),
-    src_file     TEXT NOT NULL,
-    recv_time    TIMESTAMP(6) NOT NULL,     -- 원문 라인 타임스탬프(KST)
-    report_time  TIMESTAMP(6) NOT NULL,     -- 문장 시각(KST) = 현재 프레임 시작
-    frame        TIMESTAMP(6) GENERATED ALWAYS AS
-                     (report_time - interval '1 minute') STORED,
-    channel      CHAR(1)  NOT NULL,
-    -- ↓ 이전 프레임(= frame) 을 설명하는 값들
-    rx_slots     SMALLINT,                  -- 수신 메시지가 점유한 슬롯 수(자국 송신 제외)
-    tx_slots     SMALLINT,                  -- 자국 송신이 점유한 슬롯 수(수신전용국이면 0)
-    crc_fail     SMALLINT,                  -- CRC 실패 건수(신호는 잡혔으나 디코딩 실패)
-    noise_dbm    SMALLINT,                  -- 평균 잡음(dBm, 항상 음수. 측정불가 시 NULL)
-    strong_slots SMALLINT,                  -- 잡음 대비 10dB 이상 수신된 슬롯 수
-    -- ↓ 현재 프레임(= report_time) 을 설명하는 값들
-    ext_res      SMALLINT,                  -- 외부 슬롯 예약(FATDMA 포함, 자국 제외)
-    own_res      SMALLINT,                  -- 자국 슬롯 예약
-    fsr_raw      TEXT NOT NULL,
-    -- 분·채널당 1건이 규칙. 중복 적재 방지이자 그 규칙의 강제.
-    UNIQUE (site_id, channel, report_time)
-);
-CREATE INDEX IF NOT EXISTS idx_ais_fsr_join ON ais_fsr (site_id, channel, frame);
-"""
-
-# ON CONFLICT DO NOTHING: 같은 (장소,채널,시각) 이 이미 있으면 조용히 건너뛴다.
-# 정상적인 분당 2건(A/B)은 channel 이 달라 충돌하지 않는다. 걸리는 건 같은 내용이
-# 두 번 들어오는 경우뿐이며(파일명만 다른 사본, 시간대가 겹치는 파일 등), 그대로 두면
-# LEFT JOIN 시 메시지 행이 배로 불어난다. 적재를 실패시키는 대신 무시하고 건수만 보고한다.
-INSERT_FSR = """
-INSERT INTO ais_fsr (site_id, src_file, recv_time, report_time, channel,
-                     rx_slots, tx_slots, crc_fail, ext_res, own_res,
-                     noise_dbm, strong_slots, fsr_raw) VALUES %s
-ON CONFLICT (site_id, channel, report_time) DO NOTHING
-"""
-
-# 재적재 시: 구 스키마(site_id/src_file 없음) 테이블을 비운 뒤 현재 스키마로 맞춘다.
-# 테이블을 DROP 하지 않으므로 ais_msg_* 의 FK 제약이 그대로 살아남는다.
-UPGRADE_SCHEMA = f"""
-ALTER TABLE {S.RAW_TABLE} ADD COLUMN IF NOT EXISTS site_id  SMALLINT REFERENCES rx_sites(id);
-ALTER TABLE {S.RAW_TABLE} ADD COLUMN IF NOT EXISTS src_file TEXT;
-ALTER TABLE {S.RAW_TABLE} ALTER COLUMN site_id  SET NOT NULL;
-ALTER TABLE {S.RAW_TABLE} ALTER COLUMN src_file SET NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_site_time ON {S.RAW_TABLE} (site_id, recv_time);
-CREATE INDEX IF NOT EXISTS idx_{S.RAW_TABLE}_src_file  ON {S.RAW_TABLE} (src_file);
-"""
-
+import schema as Q
 
 # ── 파싱·페어링 (ais_to_db.ipynb 와 동일 로직) ────────────────────────
 def decode_msg_type(payload):
@@ -250,53 +173,57 @@ def pair_file(path):
 
 # ── 적재 ────────────────────────────────────────────────────────────
 def _dependents(cur) -> list[str]:
-    """ais_messages(id) 를 FK 로 참조하는 테이블 목록 — TRUNCATE CASCADE 가 함께 비운다."""
-    cur.execute("""
-        SELECT DISTINCT c.conrelid::regclass::text
-          FROM pg_constraint c
-         WHERE c.contype = 'f' AND c.confrelid = %s::regclass
-         ORDER BY 1""", (S.RAW_TABLE,))
-    return [r[0] for r in cur.fetchall()]
+    """ais_messages(id) 를 FK 로 참조하는 테이블 목록. 무엇이 함께 비워지는지 알리는 용도."""
+    cur.execute(Q.SELECT_DEPENDENTS, (S.RAW_TABLE,))
+    return [r[0] for r in cur.fetchall()]      # [('ais_msg_1',), ...] → ['ais_msg_1', ...]
 
 
 def _prepare(cur, rebuild: bool) -> None:
     """스키마를 현재 형태로 맞추고, 재적재면 기존 데이터를 비운다."""
-    cur.execute("SELECT to_regclass(%s)", (S.RAW_TABLE,))
-    exists = cur.fetchone()[0] is not None
-    if not exists:
-        cur.execute(CREATE_TABLE)
-        cur.execute(CREATE_FSR)
+    # 테이블이 아예 없으면(=빈 DB) 만들기만 하고 끝. 비울 것도 검사할 것도 없다.
+    cur.execute(Q.SELECT_TABLE_EXISTS, (S.RAW_TABLE,))
+    if cur.fetchone()[0] is None:              # to_regclass 는 없으면 NULL 을 준다
+        cur.execute(Q.CREATE_TABLE)
+        cur.execute(Q.CREATE_FSR)
         return
 
-    cur.execute("SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = %s", (S.RAW_TABLE,))
+    # 현재 컬럼 목록을 읽어 '구 스키마'(site_id/src_file 이 없던 시절) 인지 판별한다.
+    cur.execute(Q.SELECT_COLUMNS, (S.RAW_TABLE,))
     cols = {r[0] for r in cur.fetchall()}
     legacy = bool({"site_id", "src_file"} - cols)
 
     if rebuild:
-        # 타입 테이블을 먼저 DROP 해 FK 를 걷어낸다. 스키마 정의가 바뀌었을 때도
-        # 그대로 반영되므로 TRUNCATE 로 비우는 것보다 안전하다.
-        dep = _dependents(cur)
+        dep = _dependents(cur)                 # 로그에 몇 개가 함께 비워지는지 알리려고 먼저 조회
+        print(f"비우는 중... (파싱 테이블 {len(dep)}개 + {S.RAW_TABLE} + ais_fsr)")
+
+        # 타입 테이블을 DROP 해 FK 를 걷어낸다(v_vsi 뷰도 이 안에서 함께 내려간다).
+        # TRUNCATE 가 아니라 DROP 인 이유: TYPE_SCHEMAS 정의가 바뀌어도 그대로 반영된다.
         P.drop_tables(cur)
-        cur.execute(f"TRUNCATE {S.RAW_TABLE} CASCADE")
+        cur.execute(Q.TRUNCATE_RAW)
         print(f"비움: {S.RAW_TABLE}" + (f" + 파싱 테이블 {len(dep)}개" if dep else ""))
+
+        # NOT NULL 부여는 행이 남아 있으면 실패한다 → 반드시 비운 뒤에 실행한다.
         if legacy:
-            cur.execute(UPGRADE_SCHEMA)          # 빈 테이블이라 NOT NULL 부여가 안전
+            cur.execute(Q.UPGRADE_SCHEMA)
             print("스키마 갱신: site_id / src_file 열 추가")
-        # ais_fsr 은 ais_messages 를 참조하지 않으므로 CASCADE 로 안 비워진다. 직접 비운다.
-        cur.execute(CREATE_FSR)
-        cur.execute("TRUNCATE ais_fsr")
+
+        # ais_fsr 은 ais_messages 를 참조하지 않아 위 CASCADE 로 안 비워진다.
+        # 없을 수도 있으므로 만든 뒤 비운다(순서가 반대면 없는 테이블을 TRUNCATE 하게 된다).
+        cur.execute(Q.CREATE_FSR)
+        cur.execute(Q.TRUNCATE_FSR)
         return
 
-    # 업데이트 모드: 구 스키마 위에서는 돌 수 없다.
-    # 파일별 멱등성이 DELETE WHERE src_file=... 에 기대는데, src_file 이 없는 기존 행은
-    # 그 DELETE 로 안 지워져 전체가 중복 적재된다.
+    # ── 여기부터는 업데이트 모드 ──
+    # 파일 단위 멱등성이 src_file 대조에 기대는데, 그 값이 없는 기존 행은
+    # '아직 안 넣은 파일'로 오판돼 통째로 중복 적재된다. 그래서 아예 막는다.
     if legacy:
         raise SystemExit(
             f"'{S.RAW_TABLE}' 가 구 스키마입니다(site_id/src_file 없음).\n"
             f"이 상태에서 업데이트하면 기존 행과 중복됩니다.\n"
             f"→ `python db/load_ais_raw.py --rebuild` 로 전체 재적재하세요.")
-    cur.execute(f"SELECT count(*) FROM {S.RAW_TABLE} WHERE src_file IS NULL")
+
+    # 열은 있는데 값이 비어 있는 행이 남은 경우도 같은 이유로 위험하다.
+    cur.execute(Q.COUNT_NULL_SRC_FILE)
     if (n := cur.fetchone()[0]):
         raise SystemExit(f"src_file 이 비어 있는 행 {n:,}개가 있습니다 — 중복 위험.\n"
                          f"→ `python db/load_ais_raw.py --rebuild` 로 전체 재적재하세요.")
@@ -304,41 +231,57 @@ def _prepare(cur, rebuild: bool) -> None:
 
 def load(sites: list[str] | None = None, rebuild: bool = False,
          no_parse: bool = False) -> None:
+    print(f"DB 접속: {S.DB['user']}@{S.DB['host']}:{S.DB['port']}/{S.DB['dbname']}")
     conn = S.connect()
-    conn.autocommit = False
+    conn.autocommit = False                      # 전 과정을 한 트랜잭션으로 — 실패 시 통째로 롤백
     try:
+        with conn.cursor() as c:
+            c.execute(Q.SET_LOCK_TIMEOUT)        # 락 대기로 무한정 멈추는 것을 방지
+
+        # sites.yaml → rx_sites 반영 후 {장소코드: id} 를 받는다. 이 id 가 모든 행에 박힌다.
         site_id = S.ensure_rx_sites(conn)
+        print(f"장소 {len(site_id)}곳: {', '.join(sorted(site_id))}")
+
+        # --site 가 주어졌으면 그 장소만 남긴다(오타는 여기서 걸러진다).
         if sites:
             if unknown := set(sites) - set(site_id):
                 raise ValueError(f"sites.yaml 에 없는 장소: {sorted(unknown)}")
             site_id = {c: i for c, i in site_id.items() if c in sites}
 
-        loaded = []                              # 이번에 적재한 src_file — 파싱 범위가 된다
+        loaded = []                              # 이번에 적재한 src_file — 뒤에서 파싱 범위가 된다
         with conn.cursor() as cur:
-            _prepare(cur, rebuild)
-            cur.execute(CREATE_FSR)              # 업데이트 모드에서 처음 만들어지는 경우
-            P.create_tables(cur)
-            cur.execute(f"SELECT DISTINCT src_file FROM {S.RAW_TABLE}")
+            _prepare(cur, rebuild)               # 비우기/스키마 정리 (모드에 따라 갈림)
+            cur.execute(Q.CREATE_FSR)            # 업데이트 모드에서 ais_fsr 이 처음 생기는 경우
+            P.create_tables(cur)                 # 타입 테이블 20개 (있으면 그대로 둔다)
+            P.create_view(cur)                   # 타입 테이블에 의존하는 v_vsi 되살리기
+
+            # 이미 들어간 파일 목록. --rebuild 면 방금 비웠으니 빈 집합이 되고,
+            # 결과적으로 아래 루프가 전체 파일을 적재하게 된다(별도 분기가 필요 없다).
+            cur.execute(Q.SELECT_LOADED_FILES)
             already = {r[0] for r in cur.fetchall()}
 
             agg, t0 = Counter(), time.time()
-            for code in sorted(site_id):
-                for fp in S.site_files(code):
-                    rel = f"{code}/{fp.name}"
+            for code in sorted(site_id):                    # 장소 순회
+                for fp in S.site_files(code):               # 그 장소 폴더의 txt 순회
+                    rel = f"{code}/{fp.name}"               # DB 에 기록할 상대 경로
                     if rel in already:
                         print(f"{rel:42s} 건너뜀 (이미 적재됨)")
                         continue
 
+                    # 파일 한 개를 파싱 — 원문 페어와 FSR 을 한 번에 얻는다.
                     records, fsr, stats = pair_file(fp)
+
+                    # 파싱 결과에 장소·출처를 붙여 INSERT 할 튜플로 만든다.
                     rows = [(t, mt, a, v, site_id[code], rel) for t, mt, a, v in records]
-                    execute_values(cur, INSERT, rows, page_size=10000)
+                    execute_values(cur, Q.INSERT, rows, page_size=10000)
+
                     dup = 0
                     if fsr:
-                        # FSR 은 파일당 최대 120건이라 한 페이지에 다 들어간다
-                        # → rowcount 가 실제 INSERT 된 행수와 일치한다.
-                        execute_values(cur, INSERT_FSR,
+                        execute_values(cur, Q.INSERT_FSR,
                                        [(site_id[code], rel, *r) for r in fsr],
                                        page_size=5000)
+                        # ON CONFLICT DO NOTHING 으로 걸러진 행수 = 보낸 수 - 실제 들어간 수.
+                        # FSR 은 파일당 최대 120건이라 한 페이지에 다 들어가므로 rowcount 가 정확하다.
                         dup = len(fsr) - cur.rowcount
 
                     loaded.append(rel)
@@ -362,7 +305,7 @@ def load(sites: list[str] | None = None, rebuild: bool = False,
             print(f"⚠ FSR 중복 {agg['fsr_dup']}건 무시됨 — 같은 (장소,채널,시각)이 "
                   f"이미 있습니다. 내용이 겹치는 원문 파일이 없는지 확인하세요.")
 
-        # 타입별 파싱. 재적재면 전량, 업데이트면 이번에 들어온 파일만.
+        # 타입별 파싱. None 을 넘기면 전량, 파일 목록을 넘기면 그 파일에서 온 행만.
         if no_parse:
             print("\n타입별 파싱 건너뜀(--no-parse) — ais_msg_* 가 원문과 어긋난 상태입니다.")
         elif rebuild or loaded:
@@ -371,41 +314,45 @@ def load(sites: list[str] | None = None, rebuild: bool = False,
         else:
             print("\n새로 적재된 파일이 없어 파싱도 건너뜁니다.")
 
-        conn.commit()
+        conn.commit()                            # 여기까지 와야 실제로 DB 에 반영된다
         summary(conn)
-    except Exception:
+    except Exception as e:
         conn.rollback()
         print("\n실패 — 롤백했습니다. DB 는 실행 전 상태 그대로입니다.")
+        if "lock timeout" in str(e).lower() or "canceling statement" in str(e).lower():
+            print("원인: 다른 연결이 테이블을 잡고 있습니다. Streamlit 대시보드나 "
+                  "DB 클라이언트를 닫고 다시 실행하세요.\n"
+                  "  확인: SELECT pid, state, left(query,60) FROM pg_stat_activity "
+                  "WHERE datname = current_database() AND pid <> pg_backend_pid();")
         raise
     finally:
         conn.close()
 
 
 def summary(conn) -> None:
-    """장소별 적재 현황(수집 시작/종료 시각은 여기서 유도된다)."""
+    """적재 결과 요약. 기대값과 대조해 이상을 바로 알아채는 것이 목적이다."""
     with conn.cursor() as cur:
-        cur.execute(f"""SELECT s.code, s.name, count(*), count(DISTINCT m.src_file),
-                               min(m.recv_time), max(m.recv_time)
-                          FROM {S.RAW_TABLE} m JOIN rx_sites s ON s.id = m.site_id
-                         GROUP BY s.code, s.name ORDER BY 5""")
+        # 장소별 행수·파일수·수집 구간. 시작/종료 시각을 테이블에 저장하지 않고
+        # min/max 로 유도하므로 항상 실제 데이터와 일치한다.
+        cur.execute(Q.SUMMARY_SITES)
         print("\n장소별 현황 (수집 시작/종료 시각은 여기서 유도된다)")
         for code, name, n, nf, t0, t1 in cur.fetchall():
             print(f"  {code:15s} {name:22s} {n:9,}행 / 파일 {nf:2d}개   {t0} ~ {t1}")
 
-        # FSR 은 커버리지가 들쭉날쭉해서(장소·시간대별로 아예 없기도 함) 따로 보여준다.
-        cur.execute("""SELECT s.code, count(*), count(DISTINCT f.frame),
-                              min(f.frame), max(f.frame), round(avg(f.noise_dbm), 1)
-                         FROM ais_fsr f JOIN rx_sites s ON s.id = f.site_id
-                        GROUP BY s.code ORDER BY 4""")
+        # FSR 은 커버리지가 들쭉날쭉해서(장소·시간대별로 결측이 있음) 따로 보여준다.
+        cur.execute(Q.SUMMARY_FSR)
         print("\nFSR 현황 (분당 채널별 1건)")
         for code, n, nmin, t0, t1, noise in cur.fetchall():
             print(f"  {code:15s} {n:6,}행 / {nmin:5,}분   {t0} ~ {t1}   평균잡음 {noise} dBm")
 
-        # 파싱 테이블 합계 — 원문의 ais_raw 보유 행수와 맞아야 정상이다.
+        # 타입별 테이블 20개의 행수를 UNION ALL 로 한 번에 센다.
+        # 테이블 이름이 코드에서 오므로(사용자 입력 아님) f-string 조립이 안전하다.
         union = " UNION ALL ".join(f"SELECT '{t}' t, count(*) n FROM {t}" for t in P.all_tables())
         cur.execute(f"SELECT t, n FROM ({union}) x WHERE n > 0 ORDER BY n DESC")
         rows = cur.fetchall()
-        cur.execute(f"SELECT count(*) FROM {S.RAW_TABLE} WHERE ais_raw IS NOT NULL")
+
+        # 위 합계는 원문의 '디코딩 대상 행수'와 같아야 한다. 다르면 디코딩 실패가 있었다는 뜻.
+        cur.execute(Q.COUNT_DECODABLE)
         n_raw = cur.fetchone()[0]
         total = sum(n for _, n in rows)
         print(f"\n타입별 파싱: {total:,}행 / 원문 디코딩 대상 {n_raw:,}행"
@@ -413,15 +360,48 @@ def summary(conn) -> None:
         print("  " + ", ".join(f"{t.replace('ais_msg_', 'type ')}={n:,}" for t, n in rows))
 
 
+# ── 명령줄 진입점 ───────────────────────────────────────────────────
+# 'python db/load_ais_raw.py --rebuild' 처럼 직접 실행했을 때만 아래가 돌아간다.
+# 다른 파일에서 import 하면 __name__ 이 "load_ais_raw" 가 되어 실행되지 않는다
+# (그래서 load() 함수를 import 해서 쓰는 것도 가능하다).
+
+# ap = argparse.ArgumentParser()      : 빈 규칙표를 가진 객체
+# ap.add_argument("--rebuild", ...)   : 규칙 등록 ─┐
+# ap.add_argument("--site", ...)      : 규칙 등록 ─┤ 여기서 "뭐가 뭔지" 결정
+# ap.add_argument("--no-parse", ...)  : 규칙 등록 ─┘
+# a = ap.parse_args()                 : 등록된 표대로 sys.argv 해석 + 검증 + 객체 생성
+
 if __name__ == "__main__":
+    # 명령줄 인자를 해석해주는 표준 라이브러리 도구. description 은 --help 맨 위에 뜨는 설명으로,
+    # 이 파일 맨 위 docstring 의 첫 줄(__doc__.splitlines()[0])을 그대로 쓴다.
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+
+    # action="append"  : 값을 리스트에 쌓는다 → --site a --site b 하면 ["a", "b"]
+    # dest="sites"     : 결과를 담을 변수명. 지정 안 하면 "site" 가 되므로 복수형으로 바꿔둔 것
+    # 아예 안 쓰면 None → load() 가 "전체 장소" 로 해석한다
     ap.add_argument("--site", action="append", dest="sites",
                     help="특정 장소 코드만 적재 (여러 번 지정 가능)")
+
+    # action="store_true" : 값을 받지 않는 on/off 스위치.
+    #   --rebuild 를 붙이면 True, 안 붙이면 False. (--rebuild=1 처럼 값을 주는 게 아니다)
     ap.add_argument("--rebuild", action="store_true",
                     help="전부 비우고 처음부터 재적재 + 전량 재파싱")
+
+    # 하이픈이 든 --no-parse 는 파이썬 변수명이 될 수 없어 자동으로 no_parse 가 되지만,
+    # 헷갈리지 않게 dest 로 명시했다.
     ap.add_argument("--no-parse", action="store_true", dest="no_parse",
                     help="적재만 하고 타입별 파싱은 건너뛴다")
+
+    # 실제로 sys.argv(명령줄에 입력된 문자열들)를 읽어 해석하는 지점.
+    # 결과 a 는 a.sites / a.rebuild / a.no_parse 를 가진 객체다.
+    # 모르는 인자가 오거나 --help 가 붙으면 여기서 안내를 출력하고 프로그램이 끝난다.
     a = ap.parse_args()
+
+    # 두 옵션의 조합은 막는다. --rebuild 는 전체를 비우므로 '특정 장소만' 과 뜻이 충돌하고,
+    # 허용하면 지정하지 않은 장소의 데이터까지 지워진다.
+    # ap.error() 는 사용법을 출력하고 종료 코드 2로 프로그램을 끝낸다.
     if a.rebuild and a.sites:
         ap.error("--rebuild 는 전체 재적재 전용입니다. --site 와 함께 쓸 수 없습니다.")
+
+    # 해석한 값을 실제 작업 함수에 넘긴다. 여기부터가 본 작업.
     load(sites=a.sites, rebuild=a.rebuild, no_parse=a.no_parse)

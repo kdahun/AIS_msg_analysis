@@ -12,6 +12,7 @@ ais_parse_by_type.ipynb 의 로직을 그대로 옮긴 것으로, load_ais_raw.p
 import enum
 import time
 from collections import defaultdict
+from pathlib import Path
 
 from psycopg2.extras import execute_values
 from pyais import decode
@@ -131,11 +132,32 @@ def all_tables() -> list[str]:
     return [table_name(k) for k in TYPE_SCHEMAS]
 
 
+# 타입 테이블 20개를 UNION ALL 로 묶은 대시보드용 뷰. 이 뷰가 테이블을 참조하므로
+# 테이블을 DROP 하려면 먼저 내려야 하고, 재생성 후 다시 만들어줘야 한다.
+VIEW_NAME = "v_vsi"
+VIEW_SQL = Path(__file__).resolve().parent.parent / "dashboard" / "sql" / "create_vsi_view.sql"
+
+
 # ── DDL ─────────────────────────────────────────────────────────────
 def drop_tables(cur) -> None:
-    """타입 테이블 전부 DROP. ais_messages 를 향한 FK 도 함께 사라진다."""
+    """타입 테이블 전부 DROP. ais_messages 를 향한 FK 도 함께 사라진다.
+
+    v_vsi 뷰가 이 테이블들에 의존하므로 먼저 내린다. CASCADE 로 한 번에 지우지 않는
+    이유는, 그러면 뷰가 조용히 사라져 대시보드가 빈 화면을 보게 되기 때문이다.
+    아래 create_view() 로 반드시 되살린다.
+    """
+    cur.execute(f"DROP VIEW IF EXISTS {VIEW_NAME}")
     for tbl in all_tables():
         cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+
+
+def create_view(cur) -> None:
+    """dashboard/sql/create_vsi_view.sql 을 실행해 v_vsi 재생성."""
+    if not VIEW_SQL.exists():
+        print(f"  ⚠ {VIEW_SQL} 이 없어 {VIEW_NAME} 뷰를 만들지 못했습니다.")
+        return
+    cur.execute(VIEW_SQL.read_text(encoding="utf-8"))
+    print(f"  {VIEW_NAME} 뷰 재생성")
 
 
 def create_tables(cur) -> None:
