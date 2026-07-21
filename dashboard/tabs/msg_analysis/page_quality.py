@@ -48,6 +48,15 @@ def _render_device_status(segments: pd.DataFrame, frame_slots: pd.DataFrame):
         "일어나지 않으므로, 거기서 끊으면 자정을 넘는 정상 간격까지 버리게 됩니다."
     )
 
+    # ── 타임라인: 장소·구간·장비 상태를 한 화면에 겹쳐 본다 ──────
+    site_label = dict(zip(segments["site_id"], segments["code"]))
+    st.plotly_chart(charts.collection_timeline(segments, half, site_label),
+                    use_container_width=True, key="quality_timeline")
+    st.caption(
+        "빨간 점선 = 장소 이동, 회색 점선 = 장비 중단 지점입니다. 막대에 마우스를 "
+        "올리면 그 구간의 시각·메시지 수·앞 공백을 볼 수 있습니다."
+    )
+
     seg = segments.copy()
     seg["앞 공백"] = seg["gap_sec"].map(
         lambda s: "-" if pd.isna(s) else

@@ -563,3 +563,78 @@ def noise_est_vs_fsr(noise: pd.DataFrame):
                       margin=dict(t=50, b=10, l=10, r=10),
                       legend=dict(orientation="h", y=1.06))
     return fig
+
+
+def collection_timeline(segments: pd.DataFrame, half_runs: pd.DataFrame,
+                        site_label: dict):
+    """수집 이력을 한 줄짜리 간트로 — 언제 어디서 무슨 일이 있었는지.
+
+    행 구성 (위→아래)
+      장소       장소별 색 막대. 사이가 비어 있으면 그때 이동했거나 꺼져 있었다
+      구간       연속 수신 구간. 막대 사이의 틈이 곧 장비 중단
+      장비 상태   정상(초록) / 반쪽 가동(주황, 메시지는 있는데 FSR 만 없음)
+
+    segments:  [segment_id, site_id, code, start, end, gap_sec, gap_reason]
+    half_runs: [site_id, channel, start, end, n_frames, n_msg]
+    """
+    fig = go.Figure()
+    ROWS = {"장소": 2, "구간": 1, "장비 상태": 0}
+    site_colors = {}
+    palette = ["#4D9FEC", "#33C4B3", "#E8A33D", "#B07FE8"]
+
+    def bar(y, x0, x1, color, name, text, width=0.34, legend=True):
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[y, y], mode="lines",
+            line=dict(color=color, width=18 * width * 2),
+            name=name, legendgroup=name, showlegend=legend,
+            hovertemplate=text + "<extra></extra>"))
+
+    seen = set()
+    for r in segments.itertuples():
+        c = site_colors.setdefault(r.site_id, palette[len(site_colors) % len(palette)])
+        label = site_label.get(r.site_id, f"site {r.site_id}")
+        bar(ROWS["장소"], r.start, r.end, c, label,
+            f"{label}<br>{r.start:%m-%d %H:%M} ~ {r.end:%m-%d %H:%M}",
+            legend=label not in seen)
+        seen.add(label)
+        gap = "" if pd.isna(r.gap_sec) else f"<br>앞 공백 {r.gap_sec:,.0f}초 ({r.gap_reason})"
+        bar(ROWS["구간"], r.start, r.end, "#7A8290", "구간",
+            f"구간 {r.segment_id} · {r.n_msg:,}건<br>"
+            f"{r.start:%m-%d %H:%M} ~ {r.end:%m-%d %H:%M}{gap}",
+            legend="구간" not in seen)
+        seen.add("구간")
+        # 장비 상태: 기본은 정상
+        bar(ROWS["장비 상태"], r.start, r.end, "#3BA776", "정상 가동",
+            f"정상 가동<br>{r.start:%m-%d %H:%M} ~ {r.end:%m-%d %H:%M}",
+            legend="정상 가동" not in seen)
+        seen.add("정상 가동")
+
+    # 반쪽 가동 구간을 장비 상태 행 위에 덧그린다 (채널 무관하게 합쳐서 표시)
+    if len(half_runs):
+        merged = (half_runs.groupby(["site_id"])
+                  .apply(lambda g: g[["start", "end"]], include_groups=False)
+                  .reset_index(drop=True))
+        for r in merged.drop_duplicates().itertuples():
+            bar(ROWS["장비 상태"], r.start, r.end + pd.Timedelta(minutes=1),
+                "#F2A33C", "반쪽 가동(FSR 없음)",
+                f"반쪽 가동 — 메시지는 정상, 상태 문장만 끊김<br>"
+                f"{r.start:%m-%d %H:%M} ~ {r.end:%m-%d %H:%M}",
+                legend="반쪽 가동(FSR 없음)" not in seen)
+            seen.add("반쪽 가동(FSR 없음)")
+
+    # 장소 이동·장비 중단 지점 표시
+    for r in segments.itertuples():
+        if pd.isna(r.gap_sec) or r.gap_sec <= 0:
+            continue
+        fig.add_vline(x=r.start, line=dict(
+            color="#F2453C" if r.gap_reason == "장소 이동" else "#9AA3B2",
+            width=1.5, dash="dot"))
+
+    fig.update_yaxes(tickmode="array", tickvals=list(ROWS.values()),
+                     ticktext=list(ROWS.keys()), range=[-0.6, 2.6])
+    fig.update_xaxes(title_text="시각 (KST)")
+    fig.update_layout(template=_TEMPLATE, height=300,
+                      margin=dict(t=30, b=10, l=10, r=10),
+                      legend=dict(orientation="h", y=1.18),
+                      hovermode="closest")
+    return fig
