@@ -1,0 +1,26 @@
+# 수집 장소 카탈로그 — DB rx_sites 테이블의 원본(single source of truth).
+#
+# · code 는 이 파일과 같은 폴더에 있는 하위 폴더명과 반드시 일치해야 한다.
+#   (예: code: kmou  ->  AIS_실해역_데이터/kmou/*.txt)
+# · 새 장소에서 수집하면 폴더를 만들고 여기에 항목을 추가한 뒤
+#   `python db/load_ais_raw.py` 를 실행하면 된다.
+# · 좌표를 정정할 때도 이 파일만 고치고 다시 실행하면 메시지는 그대로 두고
+#   rx_sites 의 좌표만 갱신된다(ON CONFLICT DO UPDATE).
+#
+# antenna_h_m: 해수면 기준 안테나 높이(m). 거리-RSSI baseline 이 여기에 직접
+#              좌우되므로 기억날 때 채워둘 것. 모르면 비워둔다(null).
+
+sites:
+  - code: busan_station
+    name: 부산역 인근 호텔
+    lat: 35.1119367
+    lon: 129.0400259
+    antenna_h_m: null
+    note: 2026-06-09 ~ 06-10 08:30 수집
+
+  - code: kmou
+    name: 국립한국해양대학교 아치캠퍼스
+    lat: 35.0805
+    lon: 129.0886
+    antenna_h_m: null
+    note: 2026-06-10 10:33 ~ 15:06 수집
