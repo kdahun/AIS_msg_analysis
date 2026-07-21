@@ -137,6 +137,8 @@ def render():
     st.divider()
     _render_noise_check(b["noise"])
     st.divider()
+    _render_reservation_check(b["fsr"], b["frameslots"], b["enriched"])
+    st.divider()
 
     sentinel = ((~df["lat"].between(-90, 90)) & (~df["lon"].between(-180, 180))
                 & (df["speed"] == SPEED_NA) & (df["heading"] == HEADING_NA)
@@ -204,3 +206,70 @@ def render():
     rt["MMSI 9자리"] = rt["mmsi"].astype(str).str.len().eq(9).map({True: "", False: "⚠ 형식 이상"})
     rt = rt.sort_values("수신")
     st.dataframe(rt, use_container_width=True, hide_index=True, height=300)
+
+
+def _render_reservation_check(fsr: pd.DataFrame, frame_slots: pd.DataFrame,
+                              enriched: pd.DataFrame):
+    """FSR 의 ext_res(예약 슬롯 수)로 두 가지를 확인한다.
+
+    ① 예약이 실제와 맞는가
+       ext_res 는 '이번 프레임에 예약된 슬롯 수'다. 그 프레임에서 실제로 수신된
+       슬롯 수와 비교하면, 예약대로 송신이 이뤄지는지 볼 수 있다.
+    ② 우리 슬롯 체인 로직이 그중 얼마를 설명하는가
+       Type 1 의 timeout/sub_message 로 다음 프레임 예약을 예측할 수 있다.
+       다만 Type 3(ITDMA)·4·18 등도 자기 슬롯을 예약하므로, 우리 예측은
+       구조적으로 ext_res 보다 작다. 그 차이를 '놓친 국'으로 읽으면 안 된다.
+    """
+    st.markdown("#### 슬롯 예약(ext_res) 검증")
+
+    norm = frame_slots[frame_slots["status"] == ""][["site_id", "channel", "frame",
+                                                     "rx_slots"]]
+    key = ["site_id", "channel", "frame"]
+    f = fsr[key + ["ext_res"]].merge(norm[key], on=key)
+    if f.empty:
+        st.info("비교할 프레임이 없습니다.")
+        return
+
+    # ① ext_res(T) vs 그 프레임(T)에서 실제 수신된 슬롯 — FSR 한 행 뒤의 rx_slots
+    nxt = norm.copy()
+    nxt["frame"] = nxt["frame"] - pd.Timedelta(minutes=1)
+    a = f.merge(nxt.rename(columns={"rx_slots": "rx_next"}), on=key)
+
+    # ② 우리 Type 1 예측
+    pred = data.predict_reservations(enriched)
+    b = f.copy()
+    b["target"] = b["frame"] + pd.Timedelta(minutes=1)
+    b = b.merge(pred, on=["site_id", "channel", "target"], how="inner")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("예약 슬롯(ext_res)", f"{f['ext_res'].median():.0f}개",
+              help="수신기가 '이번 프레임에 이만큼 예약돼 있다'고 알려주는 값")
+    if len(a):
+        c2.metric("실제 수신과의 차이", f"{(a['ext_res'] - a['rx_next']).median():+.0f}개",
+                  help="예약 대비 실제로 그 프레임에서 수신된 슬롯 수")
+    if len(b):
+        share = (b["pred_res"] / b["ext_res"] * 100).median()
+        c3.metric("우리 Type 1 예측이 설명하는 몫", f"{share:.0f}%",
+                  help="Type 1 의 timeout/sub_message 로 예측한 예약 수 ÷ ext_res")
+
+    st.caption(
+        "**예약은 실제와 잘 맞습니다.** ext_res 와 그 프레임의 실제 수신 슬롯 수가 "
+        "거의 같다는 것은, 예약한 국들이 대체로 예약대로 송신하고 수신기가 그걸 "
+        "받았다는 뜻입니다.<br>"
+        "**우리 예측이 ext_res 보다 작은 것은 정상입니다.** 우리는 Type 1 의 SOTDMA "
+        "체인만 계산하는데 ext_res 는 Type 3(ITDMA)·4·18 등 **모든 타입의 예약**을 "
+        "합한 값이기 때문입니다. 이 차이를 '우리가 놓친 국'으로 읽으면 안 됩니다 — "
+        "그렇게 쓰려면 나머지 타입의 예약 규칙까지 모델링해야 합니다.",
+        unsafe_allow_html=True)
+
+    if len(b):
+        tbl = (b.assign(설명비율=lambda d: (d["pred_res"] / d["ext_res"] * 100))
+                .groupby(["site_id", "channel"])
+                .agg(프레임=("frame", "size"),
+                     ext_res=("ext_res", "median"),
+                     우리예측=("pred_res", "median"),
+                     설명비율=("설명비율", "median"))
+                .round(1).reset_index()
+                .rename(columns={"site_id": "장소", "channel": "채널",
+                                 "ext_res": "예약(ext_res)", "설명비율": "설명 비율(%)"}))
+        st.dataframe(tbl, use_container_width=True, hide_index=True)

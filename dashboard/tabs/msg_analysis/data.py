@@ -357,3 +357,34 @@ def frame_slice(df: pd.DataFrame, frame) -> pd.DataFrame:
     if idx is None:
         return df.iloc[0:0]
     return df.iloc[idx]
+
+
+def predict_reservations(enriched: pd.DataFrame) -> pd.DataFrame:
+    """우리 슬롯 체인 로직으로 '다음 프레임에 예약된 슬롯'을 예측한다.
+
+    SOTDMA 규칙(Type 1)
+      timeout ≥ 1 → 다음 프레임에도 **같은 슬롯**을 쓴다
+      timeout = 0 → sub_message 가 다음 슬롯까지의 offset. (slot+offset)%2250 을 예약
+
+    columns=[site_id, channel, target(예약된 프레임), pred_res]
+
+    한계: Type 1 만 계산한다. Type 3(ITDMA)·4·18 등도 자기 슬롯을 예약하므로
+    FSR 의 ext_res(모든 타입의 예약 총합)보다 구조적으로 작게 나온다.
+    """
+    t1 = enriched[(enriched["msg_type"] == 1)
+                  & enriched["slot_timeout"].notna()
+                  & enriched["channel"].isin(["A", "B"])].copy()
+    if t1.empty:
+        return pd.DataFrame(columns=["site_id", "channel", "target", "pred_res"])
+    t1["slot_timeout"] = t1["slot_timeout"].astype(int)
+    t1["vsi_slot"] = t1["vsi_slot"].astype(int)
+
+    keep = t1[t1["slot_timeout"] >= 1].assign(res_slot=lambda d: d["vsi_slot"])
+    sw = t1[(t1["slot_timeout"] == 0) & t1["sub_message"].notna()].copy()
+    sw["res_slot"] = (sw["vsi_slot"] + sw["sub_message"].astype(int)) % logic.SLOTS_PER_FRAME
+
+    res = pd.concat([keep, sw])
+    res["target"] = res["frame"] + pd.Timedelta(minutes=1)
+    return (res.drop_duplicates(["site_id", "channel", "target", "res_slot"])
+               .groupby(["site_id", "channel", "target"]).size()
+               .rename("pred_res").reset_index())
