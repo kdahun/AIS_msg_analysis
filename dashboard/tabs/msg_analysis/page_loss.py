@@ -111,8 +111,9 @@ def render():
                "여유가 큰데 유실이 많으면 다른 원인(혼잡/충돌 등)입니다")
     st.dataframe(tbl, use_container_width=True, hide_index=True, height=330)
 
-    # ── 프레임별 수신 슬롯 대조 (FSR) ─────────────────────────
-    _render_frame_slots(data.get_bundle()["frameslots"])
+    # ── 유실 3단계 분해 + 프레임별 수신 슬롯 대조 (FSR) ────────
+    _render_loss_layers(b["frameslots"], lost_rows)
+    _render_frame_slots(b["frameslots"])
 
 
 def _render_frame_slots(fs: pd.DataFrame):
@@ -176,3 +177,70 @@ def _render_frame_slots(fs: pd.DataFrame):
         "**상태**가 '구간 시작/종료'면 그 1분을 통째로 받지 못해 원래 많이 비어 보이고, "
         "'FSR 없음'이면 장비가 수신은 하는데 상태 문장만 내지 않은 구간이라 비교할 수 "
         "없습니다.")
+
+
+def _render_loss_layers(fs: pd.DataFrame, lost_rows: pd.DataFrame):
+    """유실을 3단계로 나눠 본다 — 우리 로그 / 검출 실패 / 미검출.
+
+    FSR 이 알려주는 세계와 우리가 보는 세계가 다르다.
+      ① 장비가 정상 디코딩       rx_slots      → 그중 우리 로그에 남은 것 used_slots
+      ② 장비가 검출했으나 실패     crc_fail      ← 진짜 유실. 충돌 쪽
+      ③ 장비가 검출조차 못 함      어디에도 없음   ← 진짜 유실. 약신호
+    """
+    st.divider()
+    st.markdown("#### 유실의 3단계 — 어디까지 도달했는가")
+
+    norm = fs[(fs["status"] == "") & fs["crc_fail"].notna()]
+    if norm.empty:
+        st.info("FSR 이 있는 프레임이 없어 분해할 수 없습니다.")
+        return
+
+    per = (lost_rows.groupby(["site_id", "channel", "frame"])["ri_missed_count"]
+           .sum().rename("our_lost").reset_index())
+    m = norm.merge(per, on=["site_id", "channel", "frame"], how="left")
+    m["our_lost"] = m["our_lost"].fillna(0)
+    m["detect_rate"] = m["rx_slots"] / (m["rx_slots"] + m["crc_fail"]) * 100
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("장비 검출 성공률", f"{m['detect_rate'].median():.1f}%",
+              help="rx_slots / (rx_slots + crc_fail) — 검출된 신호 중 디코딩까지 성공한 비율")
+    c2.metric("프레임당 CRC 실패", f"{m['crc_fail'].median():.0f}개",
+              help="신호는 검출됐는데 깨져서 못 읽은 건수 — 충돌이거나 중간 세기 잡음")
+    c3.metric("검출조차 안 된 유실(추정)",
+              f"{(m['our_lost'] - m['crc_fail']).clip(lower=0).median():.0f}개",
+              help="우리가 센 유실에서 CRC 실패분을 뺀 나머지 — 신호가 너무 약해 "
+                   "장비가 존재조차 모르는 것")
+
+    st.caption(
+        "**CRC 실패는 '신호는 왔다'는 증거**입니다. 아예 약해서 검출조차 안 된 것은 "
+        "이 통계에도 잡히지 않으므로, 우리가 센 유실 중 CRC 실패로 설명되는 몫이 "
+        "곧 '충돌 등으로 깨진' 상한이고 나머지는 약신호로 봅니다."
+    )
+
+    tbl = (m.groupby(["site_id", "channel"])
+            .agg(프레임=("frame", "size"),
+                 수신슬롯=("rx_slots", "median"),
+                 CRC실패=("crc_fail", "median"),
+                 검출성공률=("detect_rate", "median"),
+                 우리유실=("our_lost", "median"),
+                 잡음=("noise_dbm", "median"))
+            .round(1).reset_index()
+            .rename(columns={"site_id": "장소", "channel": "채널"}))
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    a = m[m["channel"] == "A"]["detect_rate"].median()
+    b = m[m["channel"] == "B"]["detect_rate"].median()
+    if pd.notna(a) and pd.notna(b) and abs(a - b) >= 3:
+        worse, better = ("A", "B") if a < b else ("B", "A")
+        st.warning(
+            f"**채널 {worse} 의 검출 성공률이 채널 {better} 보다 눈에 띄게 낮습니다** "
+            f"({min(a,b):.1f}% vs {max(a,b):.1f}%). 두 채널의 수신량은 비슷하므로 "
+            f"트래픽 차이로는 설명되지 않습니다. 안테나·수신 경로나 해당 대역의 "
+            f"간섭원을 의심할 만합니다.")
+
+    st.caption(
+        "참고 — 잡음이 **낮은** 프레임에서 오히려 CRC 실패가 많습니다(장소 안에서 볼 때 "
+        "상관 −0.37 ~ −0.39). 조용하면 약한 신호까지 '검출'은 되어 CRC 실패로 잡히고, "
+        "시끄러우면 그 신호들이 아예 검출되지 않아 통계에서 사라지기 때문입니다. "
+        "그래서 CRC 실패 건수 자체를 수신 품질의 나쁨 지표로 바로 읽으면 안 됩니다."
+    )
