@@ -19,6 +19,60 @@ TITLE = "데이터 품질"
 RARE_MAX = 10   # 이 미만 수신이면 '희귀 MMSI'
 
 
+def _render_device_status(segments: pd.DataFrame, frame_slots: pd.DataFrame):
+    """수집 이력 — 어디서 언제 받았고, 어디서 끊겼고, 어디가 반쪽만 켜져 있었나.
+
+    장비 상태는 켜짐/꺼짐 두 가지가 아니라 셋이다.
+      정상      메시지도 FSR 도 나옴
+      반쪽 가동  메시지는 정상인데 상태 문장(FSR 등)만 끊김 — 재기동 직후로 보인다
+      중단      둘 다 없음 — 장비가 꺼졌거나 장소 이동 중
+    """
+    st.markdown("#### 수집 이력 — 구간과 장비 상태")
+
+    n_seg = len(segments)
+    n_off = int((segments["gap_reason"] == "장비 중단").sum())
+    n_move = int((segments["gap_reason"] == "장소 이동").sum())
+    half = data.device_status_runs(frame_slots)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("연속 수신 구간", f"{n_seg}개")
+    c2.metric("장비 중단", f"{n_off}회",
+              help="전 선박 무수신이 5초 이상 이어진 지점 — 여기서 시계열을 끊습니다")
+    c3.metric("장소 이동", f"{n_move}회")
+    c4.metric("반쪽 가동 구간", f"{len(half)}개",
+              help="메시지는 정상인데 FSR 등 상태 문장만 끊긴 구간")
+
+    st.caption(
+        "보고 간격과 슬롯 체인은 **구간 안에서만** 계산합니다. 장소 이동(수 시간)이나 "
+        "장비 중단(수십~수백 초)을 하나의 보고 간격으로 이으면 선박이 보고를 빼먹은 "
+        "것처럼 보이기 때문입니다. 날짜는 계산을 자르지 않습니다 — 자정에는 아무 일도 "
+        "일어나지 않으므로, 거기서 끊으면 자정을 넘는 정상 간격까지 버리게 됩니다."
+    )
+
+    seg = segments.copy()
+    seg["앞 공백"] = seg["gap_sec"].map(
+        lambda s: "-" if pd.isna(s) else
+        (f"{s/3600:.1f}시간" if s >= 3600 else f"{s/60:.1f}분" if s >= 60 else f"{s:.0f}초"))
+    show = seg.rename(columns={
+        "segment_id": "구간", "code": "장소", "start": "시작", "end": "끝",
+        "duration_min": "길이(분)", "n_msg": "메시지 수", "gap_reason": "끊긴 이유",
+    })[["구간", "장소", "시작", "끝", "길이(분)", "메시지 수", "앞 공백", "끊긴 이유"]]
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    if half.empty:
+        return
+    st.markdown("##### 반쪽 가동 구간 (메시지는 정상, FSR 만 없음)")
+    st.caption(
+        "장비가 꺼진 게 아닙니다. 이 구간에서도 메시지는 분당 수백 건씩 정상 수신되고 "
+        "RSSI·SNR·슬롯 분포가 정상 구간과 구분되지 않습니다. 재기동 직후 상태 출력 "
+        "계통만 복구되지 않은 것으로 보입니다. **메시지 분석에는 그대로 쓰고**, "
+        "FSR 기반 지표(잡음 실측·슬롯 대조)만 이 구간에서 비워 둡니다."
+    )
+    h = half.rename(columns={"channel": "채널", "start": "시작", "end": "끝",
+                             "n_frames": "분", "n_msg": "메시지 수"})
+    st.dataframe(h[["채널", "시작", "끝", "분", "메시지 수"]],
+                 use_container_width=True, hide_index=True)
+
+
 def _render_noise_check(noise: pd.DataFrame):
     """잡음층: 우리가 계산한 추정치와 수신기 실측(FSR)을 나란히 확인한다.
 
@@ -70,6 +124,8 @@ def render():
     b = data.get_bundle()
     df = b["enriched"]
 
+    _render_device_status(b["segments"], b["frameslots"])
+    st.divider()
     _render_noise_check(b["noise"])
     st.divider()
 

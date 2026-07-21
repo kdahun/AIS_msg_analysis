@@ -19,7 +19,8 @@ import pandas as pd
 #      site_id/segment_id 컬럼 추가, 거리를 장소별 좌표 기준으로 계산.
 #   5: 잡음층을 FSR 실측 우선으로. 추정치는 3~4dB 낮게 치우쳐 있었다.
 #   6: 프레임별 수신 슬롯 대조(frameslots) 추가 — FSR rx_slots vs 우리 로그.
-LOGIC_VERSION = 6
+#   7: 구간 목록(segments) 추가 — 끊긴 이유(장소 이동/장비 중단) 포함.
+LOGIC_VERSION = 7
 
 # sentinel
 HEADING_NA = 511

@@ -162,6 +162,59 @@ def _build_noise(enriched: pd.DataFrame, fsr: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_segments(enriched: pd.DataFrame, sites: pd.DataFrame) -> pd.DataFrame:
+    """구간 목록과 '왜 끊겼는지'. 화면에서 수집 이력을 훑는 용도.
+
+    columns=[segment_id, site_id, code, name, start, end, duration_min, n_msg,
+             gap_sec, gap_reason]
+      gap_sec/gap_reason 은 **앞 구간과의 공백**이다.
+        수집 시작 / 장소 이동 / 장비 중단
+    """
+    g = enriched.groupby("segment_id")
+    seg = pd.DataFrame({
+        "site_id": g["site_id"].first(),
+        "start": g["vsi_time"].min(),
+        "end": g["vsi_time"].max(),
+        "n_msg": g.size(),
+    }).reset_index().sort_values("start").reset_index(drop=True)
+    seg = seg.merge(sites[["site_id", "code", "name"]], on="site_id", how="left")
+    seg["duration_min"] = ((seg["end"] - seg["start"]).dt.total_seconds() / 60).round(1)
+
+    prev_end, prev_site = seg["end"].shift(1), seg["site_id"].shift(1)
+    seg["gap_sec"] = (seg["start"] - prev_end).dt.total_seconds().round(0)
+    seg["gap_reason"] = np.where(
+        prev_end.isna(), "수집 시작",
+        np.where(seg["site_id"] != prev_site, "장소 이동", "장비 중단"))
+    return seg
+
+
+def _runs(frames: pd.Series) -> list[tuple]:
+    """연속된 분(分)들을 (시작, 끝, 개수) 구간으로 묶는다."""
+    f = pd.Series(sorted(frames.unique()))
+    if f.empty:
+        return []
+    brk = (f.diff() != pd.Timedelta(minutes=1)).cumsum()
+    return [(g.min(), g.max(), len(g)) for _, g in f.groupby(brk)]
+
+
+def device_status_runs(frame_slots: pd.DataFrame) -> pd.DataFrame:
+    """'반쪽 가동' 구간 — 메시지는 들어오는데 FSR 만 없는 시간대.
+
+    장비가 꺼진 게 아니다. 실제로 그런 구간에서 메시지가 분당 수백 건씩 정상
+    수신되고 RSSI·SNR·슬롯 분포도 정상 구간과 구분되지 않는다. 재기동 직후
+    상태 출력 계통만 복구되지 않은 상태로 보인다.
+    → 데이터는 그대로 쓰되, FSR 기반 지표(잡음 실측·rx_slots 대조)만 비워 둔다.
+    """
+    half = frame_slots[frame_slots["status"] == "FSR 없음"]
+    rows = []
+    for (site_id, ch), g in half.groupby(["site_id", "channel"]):
+        for start, end, n in _runs(g["frame"]):
+            rows.append((site_id, ch, start, end, n,
+                         int(g[g["frame"].between(start, end)]["msgs"].sum())))
+    return pd.DataFrame(rows, columns=["site_id", "channel", "start", "end",
+                                       "n_frames", "n_msg"]).sort_values("start")
+
+
 def _build_frame_slots(slots: pd.DataFrame, fsr: pd.DataFrame,
                        enriched: pd.DataFrame) -> pd.DataFrame:
     """프레임별 '장비가 받은 슬롯 수' vs '우리 로그에 남은 슬롯 수'.
@@ -188,9 +241,12 @@ def _build_frame_slots(slots: pd.DataFrame, fsr: pd.DataFrame,
     seg = enriched.groupby("segment_id")["frame"]
     edges = set(seg.min()) | set(seg.max())
 
+    # 판정 순서가 중요하다. 구간의 첫/마지막 프레임은 그 1분을 통째로 받지 못해
+    # FSR 도 안 나오는 게 정상이므로, 'FSR 없음'보다 먼저 걸러야 한다.
+    # 그러지 않으면 수집이 분 중간에 끝난 것까지 '반쪽 가동'으로 잡힌다.
     out["status"] = np.select(
-        [out["used_slots"].isna(), out["rx_slots"].isna(), out["frame"].isin(edges)],
-        ["메시지 없음", "FSR 없음", "구간 시작/종료"],
+        [out["used_slots"].isna(), out["frame"].isin(edges), out["rx_slots"].isna()],
+        ["메시지 없음", "구간 시작/종료", "FSR 없음"],
         default="")
     return out.sort_values(["frame", "site_id", "channel"]).reset_index(drop=True)
 
@@ -220,6 +276,7 @@ def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
     enriched = logic.enrich_all(df)
     noise = _build_noise(enriched, fsr)
     frame_slots = _build_frame_slots(slots, fsr, enriched)
+    segments = _build_segments(enriched, sites)
     intrusions = logic.detect_intrusions(enriched)
     losses = logic.build_loss_layer(enriched)
 
@@ -232,10 +289,12 @@ def _precompute(key: str) -> tuple[pd.DataFrame, ...]:
     losses.to_parquet(CACHE_DIR / f"losses_{key}.parquet")
     fsr.to_parquet(CACHE_DIR / f"fsr_{key}.parquet")
     frame_slots.to_parquet(CACHE_DIR / f"frameslots_{key}.parquet")
-    return enriched, noise, intrusions, losses, fsr, frame_slots
+    segments.to_parquet(CACHE_DIR / f"segments_{key}.parquet")
+    return enriched, noise, intrusions, losses, fsr, frame_slots, segments
 
 
-_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses", "fsr", "frameslots")
+_BUNDLE_PARTS = ("enriched", "noise", "intrusions", "losses", "fsr",
+                 "frameslots", "segments")
 
 
 @st.cache_resource(show_spinner="메시지 분석 데이터 준비 중... (데이터 변경 시에만 오래 걸립니다)")
@@ -244,6 +303,7 @@ def get_bundle() -> dict:
 
     keys: enriched, noise, intrusions, losses(슬롯 특정 유실 레이어),
           fsr(수신기 프레임 통계), frameslots(프레임별 수신 슬롯 대조),
+          segments(구간 목록),
           frames(정렬된 프레임 배열), frame_idx(frame→행위치 ndarray)
     """
     key = _cache_key()
@@ -252,13 +312,13 @@ def get_bundle() -> dict:
         parts = [pd.read_parquet(paths[n]) for n in _BUNDLE_PARTS]
     else:
         parts = list(_precompute(key))
-    enriched, noise, intrusions, losses, fsr, frameslots = parts
+    enriched, noise, intrusions, losses, fsr, frameslots, segments = parts
 
     frame_idx = enriched.groupby("frame").indices          # {Timestamp: ndarray}
     frames = np.array(sorted(frame_idx.keys()))
     return dict(enriched=enriched, noise=noise, intrusions=intrusions,
                 losses=losses, fsr=fsr, frameslots=frameslots,
-                frames=frames, frame_idx=frame_idx)
+                segments=segments, frames=frames, frame_idx=frame_idx)
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)
