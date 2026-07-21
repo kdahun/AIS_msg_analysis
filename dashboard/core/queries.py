@@ -6,7 +6,7 @@ import math
 import pandas as pd
 
 from core.db import run_query
-from core.constants import VIEW, RAW_TABLE, RX_LAT, RX_LON, UNIV_START
+from core.constants import VIEW, RAW_TABLE
 
 
 # ── 장소 필터 (사이드바 전역 선택) ────────────────────────────
@@ -293,33 +293,51 @@ def _explorer_where(msg_types, mmsis, start, end):
 
 
 # ── 탭 4: 신호 유효성 (위치 기반) ─────────────────────────────
-# 수신국(RX_LAT/RX_LON)이 확정된 구간(UNIV_START 이후)의 Type 1/3 동적 위치보고만 대상으로,
-# Haversine 으로 수신국까지 거리(dist_m)를 계산해 반환한다. core.signal_model 이 이 결과를
-# 받아 거리구간별 baseline/이상치를 계산한다.
-def load_dynamic_positions(mmsis: list[int] | None = None) -> pd.DataFrame:
-    """Type 1/3 동적 위치보고 + 수신국 기준 거리(dist_m). UNIV_START 이후만 대상.
+# Type 1/3 동적 위치보고에 대해, **그 메시지를 받은 장소의 좌표** 기준 거리를 계산한다.
+# 예전에는 해양대 좌표 하나만 알아서 그 구간(UNIV_START 이후)만 대상으로 삼았지만,
+# 이제 rx_sites 에 장소별 좌표가 있으므로 전 구간을 볼 수 있다(대상이 4배로 늘어난다).
+# core.signal_model 이 이 결과를 받아 거리구간별 baseline/이상치를 계산하는데,
+# baseline 은 반드시 **장소별로 따로** 만들어야 한다 — 안테나 높이·주변 지형이 달라
+# 거리-RSSI 관계 자체가 다르므로 섞으면 회귀가 오염된다.
+def load_dynamic_positions(mmsis: list[int] | None = None,
+                           site_ids: list[int] | None = None) -> pd.DataFrame:
+    """Type 1/3 동적 위치보고 + 수신 장소 기준 거리(dist_m).
+
     vsi_time 은 recv_time 대신 시간순 궤적을 그릴 때 쓰는 정밀 시각(points() 와 동일 방식).
-    columns=[source_id, vsi_time, recv_time, mmsi, msg_type, lon, lat, vsi_rssi, vsi_snr, dist_m]
+    columns=[source_id, vsi_time, recv_time, mmsi, msg_type, lon, lat,
+             vsi_rssi, vsi_snr, site_id, site_code, dist_m]
     """
-    haversine = f"""
+    # 거리 기준점이 행마다 다르므로 rx_sites 를 조인해 그 장소의 좌표를 쓴다.
+    haversine = """
         2 * 6371000 * asin(sqrt(
-            power(sin(radians(lat - {RX_LAT}) / 2), 2) +
-            cos(radians({RX_LAT})) * cos(radians(lat)) *
-            power(sin(radians(lon - {RX_LON}) / 2), 2)
+            power(sin(radians(t.lat - s.lat) / 2), 2) +
+            cos(radians(s.lat)) * cos(radians(t.lat)) *
+            power(sin(radians(t.lon - s.lon) / 2), 2)
         ))
     """
-    where = ["recv_time >= :univ_start",
-             "lon BETWEEN -180 AND 180", "lat BETWEEN -90 AND 90"]
-    params = {"univ_start": UNIV_START}
+    where = ["t.lon BETWEEN -180 AND 180", "t.lat BETWEEN -90 AND 90"]
+    params = {}
     if mmsis:
-        where.append("mmsi = ANY(:mmsis)")
+        where.append("t.mmsi = ANY(:mmsis)")
         params["mmsis"] = list(mmsis)
+    sites = site_ids if site_ids is not None else selected_sites()
+    if sites:
+        where.append("m.site_id = ANY(:sites)")
+        params["sites"] = [int(x) for x in sites]
     where_sql = " AND ".join(where)
 
-    parts = [
+    union = " UNION ALL ".join(
         f"""SELECT source_id, {_VSI_TIME_EXPR} AS vsi_time, recv_time, mmsi,
-                   {mt} AS msg_type, lon, lat, vsi_rssi, vsi_snr, {haversine} AS dist_m
-            FROM {tbl} WHERE {where_sql}"""
-        for tbl, mt in (("ais_msg_1", 1), ("ais_msg_3", 3))
-    ]
-    return run_query(" UNION ALL ".join(parts), params)
+                   {mt} AS msg_type, lon, lat, vsi_rssi, vsi_snr
+            FROM {tbl}"""
+        for tbl, mt in (("ais_msg_1", 1), ("ais_msg_3", 3)))
+    return run_query(
+        f"""
+        SELECT t.source_id, t.vsi_time, t.recv_time, t.mmsi, t.msg_type,
+               t.lon, t.lat, t.vsi_rssi, t.vsi_snr,
+               m.site_id, s.code AS site_code, {haversine} AS dist_m
+        FROM ({union}) t
+        JOIN {RAW_TABLE} m ON m.id = t.source_id
+        JOIN rx_sites   s ON s.id = m.site_id
+        WHERE {where_sql}
+        """, params)
